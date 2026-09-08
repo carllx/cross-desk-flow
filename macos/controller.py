@@ -17,7 +17,7 @@ import socket
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from bridge_core.contract import (
     DEFAULT_LOCAL_IPC_PORT,
@@ -34,7 +34,7 @@ from bridge_core.peer_discovery import PeerDiscoveryService
 from bridge_core.preflight import check_runtime_dependencies
 from bridge_core.process_runner import ProcessRunner
 
-from .device_resolver import MacCoreAudioDeviceResolver
+from .device_resolver import MacCoreAudioDeviceResolver, check_microphone_authorization
 from .microphone_sender import MicrophoneSenderBuilder
 from .process_runner import MacOwnedProcessRunner
 from .speaker_receiver import SpeakerReceiverBuilder
@@ -197,6 +197,7 @@ class MacBridgeController:
         microphone_sender_builder: Optional[MicrophoneSenderBuilder] = None,
         lock_port: int = DEFAULT_SINGLETON_PORT,
         ipc_port: int = DEFAULT_LOCAL_IPC_PORT,
+        mic_permission_probe: Optional[Any] = None,
     ):
         self.state_file = state_file
         self.process_runner = process_runner or MacOwnedProcessRunner()
@@ -205,6 +206,7 @@ class MacBridgeController:
         self.microphone_sender_builder = (
             microphone_sender_builder or MicrophoneSenderBuilder()
         )
+        self.mic_permission_probe = mic_permission_probe or check_microphone_authorization
         self.lock_port = lock_port
         self.ipc_port = ipc_port
         self._singleton_lock = SingleInstanceLock(port=lock_port)
@@ -252,9 +254,53 @@ class MacBridgeController:
         except Exception as exc:
             logger.warning("Could not persist desired state: %s", exc)
 
+    def start_host(self) -> bool:
+        """Starts the controller host (used by LaunchAgent / daemon).
+
+        Acquires singleton lock, preflights runtime dependencies, starts IPC server,
+        starts peer discovery service, and reconciles according to the PERSISTED desired state.
+        DOES NOT mutate or overwrite persisted desired state.
+        """
+        with self._lock:
+            # Check runtime dependencies preflight
+            ok, err_msg = check_runtime_dependencies()
+            if not ok:
+                self._last_actionable_error = err_msg
+                self._controller_state = LifecycleState.ERROR
+                logger.error("Preflight failure: %s", err_msg)
+                return False
+
+            if not self._singleton_lock.is_held:
+                if not self._singleton_lock.acquire():
+                    logger.warning("Controller host start rejected: another process holds the singleton lock")
+                    return False
+
+            # Reload persisted desired state to ensure consistency
+            self._desired_state = self._load_persisted_desired_state()
+            if self._desired_state == DesiredState.STOPPED_BY_USER:
+                self._controller_state = LifecycleState.STOPPED
+            else:
+                self._controller_state = LifecycleState.STARTING
+            self._speaker_path_state = PathState.IDLE
+            self._last_actionable_error = None
+
+            # Start IPC server
+            self._ipc_server.start()
+
+            # Start discovery
+            try:
+                self.discovery_service.start()
+            except Exception as exc:
+                self._last_actionable_error = f"Discovery start failed: {exc}"
+                self._controller_state = LifecycleState.ERROR
+
+            self.reconcile()
+            return True
+
     def start(self) -> bool:
-        """Enables the controller and triggers reconcile.
+        """Explicit user start intent: enables the controller and triggers reconcile.
         
+        Persists DesiredState.ENABLED.
         Returns True if this instance successfully holds or already holds the singleton lock.
         Returns False if another process holds the singleton lock.
         """
@@ -308,7 +354,7 @@ class MacBridgeController:
             return self._microphone_path_state == PathState.RUNNING
 
     def stop(self) -> bool:
-        """Idempotently stops speaker and microphone pipelines and sets STOPPED_BY_USER."""
+        """Idempotently stops speaker and microphone pipelines and persists STOPPED_BY_USER."""
         with self._lock:
             self._desired_state = DesiredState.STOPPED_BY_USER
             self._persist_desired_state(DesiredState.STOPPED_BY_USER)
@@ -333,12 +379,34 @@ class MacBridgeController:
             self._controller_state = LifecycleState.STOPPED
             return True
 
-    def shutdown(self) -> None:
-        """Full shutdown of controller, releasing singleton lock and IPC server."""
-        self.stop()
+    def shutdown_host(self) -> None:
+        """Shuts down the controller host process without mutating persisted user desired state."""
         with self._lock:
+            # Stop owned speaker pipeline child
+            if self._speaker_child_pid is not None:
+                self.process_runner.stop_process(self._speaker_child_pid)
+                self._speaker_child_pid = None
+            self._active_peer_address = None
+            self._active_local_bind = None
+            self._speaker_path_state = PathState.STOPPED
+
+            # Stop owned microphone pipeline child
+            if self._microphone_child_pid is not None:
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+            self._microphone_path_state = PathState.STOPPED
+
+            # Stop discovery
+            self.discovery_service.stop()
+
+            # Stop IPC server & release singleton lock
             self._ipc_server.stop()
             self._singleton_lock.release()
+            self._controller_state = LifecycleState.STOPPED
+
+    def shutdown(self) -> None:
+        """Full shutdown of controller host. Does NOT mutate persisted user desired state."""
+        self.shutdown_host()
 
     def get_status(self) -> ControllerStatus:
         """Pure read-only query of controller status without side-effects."""
@@ -540,6 +608,20 @@ class MacBridgeController:
                 return
             # Child exited unexpectedly
             self._microphone_child_pid = None
+
+        # Check macOS microphone permission authorization status
+        if self.mic_permission_probe:
+            try:
+                auth_status = self.mic_permission_probe()
+                if auth_status in (1, 2):  # 1: Restricted, 2: Denied
+                    self._last_actionable_microphone_error = (
+                        "macOS Microphone permission denied: please grant permission in "
+                        "System Settings -> Privacy & Security -> Microphone"
+                    )
+                    self._microphone_path_state = PathState.FAILED
+                    return
+            except Exception as exc:
+                logger.debug("Microphone authorization check probe error: %s", exc)
 
         # Check GStreamer availability for sender
         if not self.microphone_sender_builder.is_gstreamer_available():
