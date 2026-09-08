@@ -12,7 +12,7 @@ import logging
 import os
 import signal
 import subprocess
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from bridge_core.process_runner import ProcessRunner
 
@@ -24,6 +24,7 @@ class MacOwnedProcessRunner(ProcessRunner):
 
     def __init__(self):
         self._owned_processes: Dict[int, subprocess.Popen] = {}
+        self._owned_metadata: Dict[int, dict] = {}
 
     def start_process(self, cmd: List[str]) -> int:
         """Starts a child process in a dedicated session and tracks ownership."""
@@ -35,12 +36,24 @@ class MacOwnedProcessRunner(ProcessRunner):
         )
         pid = proc.pid
         self._owned_processes[pid] = proc
+        create_time = None
+        try:
+            import psutil
+            create_time = psutil.Process(pid).create_time()
+        except Exception:
+            pass
+        self._owned_metadata[pid] = {
+            "pid": pid,
+            "cmd": list(cmd),
+            "create_time": create_time,
+        }
         logger.info("Started owned child process [PID %d]: %s", pid, cmd[0])
         return pid
 
     def stop_process(self, pid: int) -> None:
         """Stops ONLY the specific owned process by PID / PGID."""
         proc = self._owned_processes.pop(pid, None)
+        self._owned_metadata.pop(pid, None)
         if not proc:
             logger.debug("PID %d is not in owned processes map; ignoring", pid)
             return
@@ -80,6 +93,10 @@ class MacOwnedProcessRunner(ProcessRunner):
             return False
         return proc.poll() is None
 
+    def get_child_metadata(self, pid: int) -> Optional[dict]:
+        """Returns startup metadata for a tracked child process."""
+        return self._owned_metadata.get(pid)
+
     def stop_all_owned(self) -> None:
         """Stops all processes owned by this controller instance."""
         pids = list(self._owned_processes.keys())
@@ -88,3 +105,4 @@ class MacOwnedProcessRunner(ProcessRunner):
 
     def __del__(self):
         self.stop_all_owned()
+
