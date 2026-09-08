@@ -313,8 +313,19 @@ class MacBridgeController:
                 self._microphone_path_state = PathState.FAILED
             return False
 
-        # Termination confirmed
-        self._record_child_stopped(role)
+        # Termination confirmed: record in journal
+        journal_updated = self._record_child_stopped(role)
+        if not journal_updated:
+            err_msg = f"Failed to atomically update ownership journal after stopping {role} child [PID {pid}]"
+            logger.error(err_msg)
+            if role == "speaker":
+                self._last_actionable_error = err_msg
+                self._speaker_path_state = PathState.FAILED
+            else:
+                self._last_actionable_microphone_error = err_msg
+                self._microphone_path_state = PathState.FAILED
+            return False
+
         if role == "speaker":
             self._speaker_child_pid = None
         else:
@@ -910,13 +921,23 @@ class MacBridgeController:
 
             # 1. Controller STOPPED_BY_USER -> Stop both speaker and microphone
             if self._desired_state == DesiredState.STOPPED_BY_USER:
-                self._stop_child("speaker")
-                self._stop_child("microphone")
-                self._active_peer_address = None
-                self._active_local_bind = None
-                self._speaker_path_state = PathState.STOPPED
-                self._microphone_path_state = PathState.STOPPED
-                self._controller_state = LifecycleState.STOPPED
+                spk_stopped = self._stop_child("speaker")
+                mic_stopped = self._stop_child("microphone")
+                if spk_stopped:
+                    self._active_peer_address = None
+                    self._active_local_bind = None
+                    self._speaker_path_state = PathState.STOPPED
+                if mic_stopped:
+                    self._microphone_path_state = PathState.STOPPED
+
+                if not spk_stopped or not mic_stopped:
+                    self._controller_state = LifecycleState.ERROR
+                    err_msg = "Stop failed: one or more owned child processes could not be confirmed stopped or unjournaled"
+                    if not self._last_actionable_error:
+                        self._last_actionable_error = err_msg
+                    logger.error(err_msg)
+                else:
+                    self._controller_state = LifecycleState.STOPPED
                 return
 
             # 2. Peer Ambiguous -> Stop both speaker and microphone

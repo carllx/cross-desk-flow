@@ -21,7 +21,7 @@ import time
 import pytest
 import psutil
 
-from bridge_core.contract import DesiredState, DEFAULT_SPEAKER_RTP_PORT
+from bridge_core.contract import DesiredState, PathState, DEFAULT_SPEAKER_RTP_PORT
 from macos.controller import MacBridgeController, DEFAULT_STATE_FILE
 from macos.process_runner import MacOwnedProcessRunner
 
@@ -683,7 +683,7 @@ def test_successful_verified_recovery_clears_journal(isolated_env):
 
     # Recovery must succeed cleanly
     assert ctrl.start_host()
-    assert ctrl.get_status().controller_state in ("RUNNING", "READY", "IDLE")
+    assert ctrl.get_status().controller_state in ("ACTIVE", "DISCOVERING", "STARTING", "STOPPED", "IDLE")
 
     # The stale process must be dead
     time.sleep(0.5)
@@ -967,6 +967,186 @@ def test_journal_clear_failure_not_reported_as_successful_recovery(isolated_env,
     assert "failed to remove ownership journal file" in (status.last_actionable_error or "").lower()
 
     ctrl.shutdown()
+
+
+def test_record_child_stopped_failure_causes_stop_child_to_return_false(isolated_env, monkeypatch):
+    """Browser Review Correction 1: _stop_child must honor journal-update result.
+    If journal update fails after process death is confirmed, _stop_child must return False,
+    surface actionable error, and mark path as FAILED.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    proc = subprocess.Popen(
+        ["sleep", "10"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    ctrl._speaker_child_pid = proc.pid
+
+    # Simulate _record_child_stopped failing
+    monkeypatch.setattr(ctrl, "_record_child_stopped", lambda role: False)
+
+    # Process will be stopped, but journal update fails
+    success = ctrl._stop_child("speaker")
+    assert success is False
+    assert ctrl._speaker_path_state.value == "FAILED"
+    assert "ownership journal" in (ctrl._last_actionable_error or "").lower()
+
+    ctrl.shutdown()
+
+
+def test_stopped_by_user_reconcile_speaker_stop_failure_sets_error_and_preserves_failed_state(isolated_env, monkeypatch):
+    """Browser Review Correction 2: Under STOPPED_BY_USER reconcile, if speaker stop fails,
+    controller_state must become ERROR and speaker_path_state must be FAILED, not STOPPED.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = False
+        peer_address = None
+        local_bind_address = None
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    # Simulate speaker child stop failure
+    def fake_stop_child(role):
+        if role == "speaker":
+            ctrl._speaker_path_state = PathState.FAILED
+            ctrl._last_actionable_error = "Fake speaker stop failure"
+            return False
+        return True
+
+    monkeypatch.setattr(ctrl, "_stop_child", fake_stop_child)
+
+    ctrl._desired_state = DesiredState.STOPPED_BY_USER
+    ctrl.reconcile()
+
+    status = ctrl.get_status()
+    assert status.controller_state == "ERROR"
+    assert status.speaker_path_state == "FAILED"
+    assert status.microphone_path_state == "STOPPED"
+    assert "Fake speaker stop failure" in (status.last_actionable_error or "")
+
+    ctrl.shutdown()
+
+
+def test_stopped_by_user_reconcile_mic_stop_failure_sets_error_and_preserves_failed_state(isolated_env, monkeypatch):
+    """Browser Review Correction 2: Under STOPPED_BY_USER reconcile, if microphone stop fails,
+    controller_state must become ERROR and microphone_path_state must be FAILED, not STOPPED.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = False
+        peer_address = None
+        local_bind_address = None
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    # Simulate microphone child stop failure
+    def fake_stop_child(role):
+        if role == "microphone":
+            ctrl._microphone_path_state = PathState.FAILED
+            ctrl._last_actionable_microphone_error = "Fake mic stop failure"
+            return False
+        return True
+
+    monkeypatch.setattr(ctrl, "_stop_child", fake_stop_child)
+
+    ctrl._desired_state = DesiredState.STOPPED_BY_USER
+    ctrl.reconcile()
+
+    status = ctrl.get_status()
+    assert status.controller_state == "ERROR"
+    assert status.speaker_path_state == "STOPPED"
+    assert status.microphone_path_state == "FAILED"
+    assert "could not be confirmed stopped or unjournaled" in (status.last_actionable_error or "")
+
+    ctrl.shutdown()
+
+
+def test_stopped_by_user_reconcile_success_sets_both_stopped_and_controller_stopped(isolated_env, monkeypatch):
+    """Under STOPPED_BY_USER reconcile, when both child processes stop successfully,
+    controller_state and both path states must be STOPPED.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = False
+        peer_address = None
+        local_bind_address = None
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    monkeypatch.setattr(ctrl, "_stop_child", lambda role: True)
+
+    ctrl._desired_state = DesiredState.STOPPED_BY_USER
+    ctrl.reconcile()
+
+    status = ctrl.get_status()
+    assert status.controller_state == "STOPPED"
+    assert status.speaker_path_state == "STOPPED"
+    assert status.microphone_path_state == "STOPPED"
+    assert status.last_actionable_error is None
+
+    ctrl.shutdown()
+
 
 
 
