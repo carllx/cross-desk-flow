@@ -17,9 +17,10 @@ import sys
 import time
 from typing import Any, Dict, Optional, Tuple
 
-import ntsecuritycon
-import win32api
-import win32security
+import shutil
+import sys
+import time
+from typing import Any, Dict, Optional, Tuple
 
 from bridge_core.contract import DEFAULT_LOCAL_IPC_PORT
 from .cli import send_ipc_command
@@ -29,8 +30,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_TASK_NAME = "desk-audio-bridge"
 
 
+def _check_pywin32_dependency() -> None:
+    """Checks whether pywin32 is installed and raises actionable RuntimeError if absent."""
+    try:
+        import win32api
+        import win32security
+        import win32com.client
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing Windows lifecycle dependency 'pywin32'. "
+            "Please install dependencies with 'pip install -r requirements.txt' "
+            "(or 'pip install pywin32') to use Task Scheduler lifecycle commands."
+        ) from exc
+
+
 def get_current_user_sid() -> str:
     """Resolves current user token SID as string."""
+    _check_pywin32_dependency()
+    import ntsecuritycon
+    import win32api
+    import win32security
+
     tok = win32security.OpenProcessToken(win32api.GetCurrentProcess(), ntsecuritycon.TOKEN_QUERY)
     try:
         sid, _ = win32security.GetTokenInformation(tok, ntsecuritycon.TokenUser)
@@ -72,6 +92,7 @@ def get_launcher_path() -> str:
 
 def _get_scheduler_folder():
     """Connects to Windows Task Scheduler COM service and returns root folder."""
+    _check_pywin32_dependency()
     import win32com.client
     ts = win32com.client.Dispatch("Schedule.Service")
     ts.Connect()
@@ -225,7 +246,23 @@ def install_scheduled_task(task_name: str = DEFAULT_TASK_NAME, start_service: bo
             task = folder.GetTask(task_name)
             task.Run(None)
         except Exception as exc:
-            logger.warning("Could not immediately trigger scheduled task: %s", exc)
+            return False, f"Scheduled task '{task_name}' was registered, but immediate trigger failed: {exc}"
+
+        # Bounded verification window: verify lifecycle-managed controller becomes responsive
+        start_wait = time.time()
+        controller_active = False
+        while time.time() - start_wait < 5.0:
+            status = send_ipc_command("status")
+            if status is not None and status.get("owner_pid") is not None:
+                controller_active = True
+                break
+            time.sleep(0.2)
+
+        if not controller_active:
+            return False, (
+                f"Scheduled task '{task_name}' registered successfully, but background controller "
+                "did not become responsive on IPC within 5.0s verification window"
+            )
 
     return True, msg
 

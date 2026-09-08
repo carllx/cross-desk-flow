@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -55,6 +56,7 @@ from windows.task_scheduler import (
     terminate_verified_controller_host,
     uninstall_scheduled_task,
 )
+from windows.cli import send_ipc_command
 
 
 @pytest.fixture
@@ -352,3 +354,80 @@ def test_uninstall_cleanup_and_idempotency(temp_state_file):
         # Repeated uninstall must succeed cleanly
         ok2, msg2 = uninstall_scheduled_task(task_name=test_task, cleanup_state=True)
         assert ok2 is True, msg2
+
+
+def test_ipc_host_shutdown_flow_terminates_process_and_preserves_state(temp_state_file):
+    """Running host receiving IPC shutdown must exit naturally, preserve desired state, and free singleton."""
+    # Write initial ENABLED state
+    with open(temp_state_file, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    test_ipc_port = 52199
+    test_lock_port = 52198
+
+    # Start a real controller process via python with custom ports and state file
+    code = (
+        "import sys, os, time\n"
+        "from windows.controller import WindowsBridgeController\n"
+        "from unittest.mock import patch\n"
+        f"ctrl = WindowsBridgeController(state_file=r'{temp_state_file}', lock_port={test_lock_port}, ipc_port={test_ipc_port})\n"
+        "with patch('windows.controller.check_runtime_dependencies', return_value=(True, '')):\n"
+        "    if not ctrl.start_host():\n"
+        "        sys.exit(2)\n"
+        "    while not ctrl.is_shutdown_requested:\n"
+        "        time.sleep(0.1)\n"
+        "    ctrl.shutdown_host()\n"
+        "sys.exit(0)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code])
+    try:
+        # Wait for IPC to become responsive
+        time.sleep(1.0)
+        assert proc.poll() is None, "Host process must be running"
+
+        # Send IPC shutdown
+        res = send_ipc_command("shutdown", port=test_ipc_port)
+        assert res is not None and res.get("success") is True
+
+        # Host process must exit cleanly within bounded time
+        proc.wait(timeout=4.0)
+        assert proc.returncode == 0
+
+        # Verify desired state remains ENABLED
+        with open(temp_state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            assert data.get("desired_state") == DesiredState.ENABLED.value
+
+        # Verify IPC no longer responds
+        assert send_ipc_command("status", port=test_ipc_port) is None
+
+        # Verify singleton lock is free and can be acquired
+        new_lock = SingleInstanceLock(port=test_lock_port)
+        assert new_lock.acquire() is True
+        new_lock.release()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_missing_pywin32_actionable_error():
+    """Missing pywin32 must raise actionable RuntimeError mentioning requirements.txt or pip install."""
+    with patch.dict(sys.modules, {"win32api": None, "win32security": None, "win32com.client": None}):
+        from windows.task_scheduler import _check_pywin32_dependency
+        with pytest.raises(RuntimeError, match="Missing Windows lifecycle dependency 'pywin32'"):
+            _check_pywin32_dependency()
+
+
+def test_install_scheduled_task_truthful_activation_failure():
+    """When immediate controller launch is requested but controller fails to become responsive, install fails truthfully."""
+    test_task = "desk-audio-bridge-activation-test"
+    with patch("windows.task_scheduler.register_scheduled_task", return_value=(True, "ok")), \
+         patch("windows.task_scheduler._get_scheduler_folder") as mock_folder, \
+         patch("windows.task_scheduler.terminate_verified_controller_host", return_value=True), \
+         patch("windows.task_scheduler.send_ipc_command", return_value=None):
+        mock_task = MagicMock()
+        mock_folder.return_value.GetTask.return_value = mock_task
+        from windows.task_scheduler import install_scheduled_task
+        ok, msg = install_scheduled_task(task_name=test_task, start_service=True)
+        assert ok is False
+        assert "did not become responsive on IPC" in msg

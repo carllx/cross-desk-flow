@@ -155,8 +155,8 @@ class LocalControlServer:
                     success = self.controller.set_microphone_enabled(False)
                     res = {"success": success, "microphone_path_state": self.controller.get_status().microphone_path_state}
                 elif cmd == "shutdown":
-                    # Clean host shutdown: do not change desired state
-                    self.controller.shutdown_host()
+                    # Request graceful host shutdown via main loop: do not mutate desired state
+                    self.controller.request_host_shutdown()
                     res = {"success": True}
                 else:
                     res = {"error": f"Unknown command {cmd}"}
@@ -213,6 +213,7 @@ class WindowsBridgeController:
         self._microphone_path_state = PathState.IDLE
         self._microphone_child_pid: Optional[int] = None
         self._last_actionable_microphone_error: Optional[str] = None
+        self._shutdown_requested = threading.Event()
         self._lock = threading.RLock()
 
         # Wire discovery service
@@ -365,6 +366,15 @@ class WindowsBridgeController:
                 self._microphone_path_state = PathState.STOPPED
 
             return True
+
+    def request_host_shutdown(self) -> None:
+        """Requests graceful host shutdown from the host main loop without mutating desired state."""
+        self._shutdown_requested.set()
+
+    @property
+    def is_shutdown_requested(self) -> bool:
+        """Returns True if a shutdown has been requested."""
+        return self._shutdown_requested.is_set()
 
     def shutdown_host(self) -> None:
         """Shuts down host runtime, stopping owned children, IPC, and singleton WITHOUT mutating desired state."""
