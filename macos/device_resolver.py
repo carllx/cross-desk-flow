@@ -460,3 +460,45 @@ class MacCoreAudioDeviceResolver:
             return selected
 
         return None
+
+
+def check_microphone_authorization() -> int:
+    """Probes macOS microphone authorization status via AVFoundation.
+
+    Return values map to AVAuthorizationStatus:
+      0: NotDetermined
+      1: Restricted
+      2: Denied
+      3: Authorized
+      -1: Unknown / probe error
+    Does NOT request permission or trigger UI prompts.
+    """
+    try:
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AVFoundation.framework/AVFoundation")
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.objc_msgSend.restype = ctypes.c_long
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        cls = objc.objc_getClass(b"AVCaptureDevice")
+        sel = objc.sel_registerName(b"authorizationStatusForMediaType:")
+        # 'soun' corresponds to AVMediaTypeAudio
+        media_type = cf.CFStringCreateWithCString(None, b"soun", 0x08000100)
+        try:
+            status = objc.objc_msgSend(cls, sel, media_type)
+            return int(status)
+        finally:
+            cf.CFRelease(media_type)
+    except Exception as exc:
+        logger.debug("Microphone authorization check probe error: %s", exc)
+        return -1
+
