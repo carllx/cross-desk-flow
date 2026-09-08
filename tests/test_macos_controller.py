@@ -74,8 +74,14 @@ class FakeProcessRunner(ProcessRunner):
 
 
 class FakeDeviceResolver(MacCoreAudioDeviceResolver):
-    def __init__(self, device: Optional[ResolvedAudioDevice] = None, fail: bool = False):
-        if device is None and not fail:
+    def __init__(
+        self,
+        speaker: Optional[ResolvedAudioDevice] = None,
+        microphone: Optional[ResolvedAudioDevice] = None,
+        fail: bool = False,
+        fail_mic: bool = False,
+    ):
+        if speaker is None and not fail:
             self._device = ResolvedAudioDevice(
                 device_id=88,
                 device_uid="BuiltInSpeakerUID_Test",
@@ -83,15 +89,36 @@ class FakeDeviceResolver(MacCoreAudioDeviceResolver):
                 is_builtin=True,
                 output_channels=2,
                 is_default=True,
+                input_channels=0,
             )
         else:
-            self._device = device
+            self._device = speaker
+
+        if microphone is None and not fail and not fail_mic:
+            self._microphone = ResolvedAudioDevice(
+                device_id=89,
+                device_uid="BuiltInMicrophoneUID_Test",
+                device_name="MacBook Air Microphone",
+                is_builtin=True,
+                output_channels=0,
+                is_default=True,
+                input_channels=1,
+            )
+        else:
+            self._microphone = microphone
+
         self.fail = fail
+        self.fail_mic = fail_mic
 
     def resolve_builtin_speaker_device(self) -> Optional[ResolvedAudioDevice]:
         if self.fail:
             return None
         return self._device
+
+    def resolve_builtin_microphone_device(self) -> Optional[ResolvedAudioDevice]:
+        if self.fail or self.fail_mic:
+            return None
+        return self._microphone
 
 
 class FakeReceiverBuilder(SpeakerReceiverBuilder):
@@ -180,13 +207,14 @@ def test_repeated_start_is_idempotent_and_creates_single_receiver(temp_state_fil
     status1 = controller.get_status()
     assert status1.desired_state == DesiredState.ENABLED.value
     assert status1.speaker_path_state == PathState.RUNNING.value
-    assert len(runner.started_commands) == 1
+    assert status1.microphone_path_state == PathState.RUNNING.value
+    assert len(runner.started_commands) == 2
 
     assert controller.start() is True
     status2 = controller.get_status()
     assert status2.desired_state == DesiredState.ENABLED.value
-    assert len(runner.started_commands) == 1
-    assert status2.owned_children_count == 1
+    assert len(runner.started_commands) == 2
+    assert status2.owned_children_count == 2
 
     controller.shutdown()
 
@@ -204,7 +232,7 @@ def test_repeated_stop_is_idempotent_and_cleans_owned_process(temp_state_file):
     )
 
     controller.start()
-    assert len(runner.running_pids) == 1
+    assert len(runner.running_pids) == 2
 
     assert controller.stop() is True
     status1 = controller.get_status()
@@ -524,12 +552,12 @@ def test_macos_cross_process_ipc_lifecycle(temp_state_file):
     assert res_status is not None
     assert res_status["desired_state"] == DesiredState.ENABLED.value
     assert res_status["role"] == HostRole.MACOS.value
-    assert res_status["owned_children_count"] == 1
+    assert res_status["owned_children_count"] == 2
 
     res_start = send_ipc_command("start", port=ipc_port)
     assert res_start is not None
     assert res_start["success"] is True
-    assert len(runner.started_commands) == 1
+    assert len(runner.started_commands) == 2
 
     res_stop = send_ipc_command("stop", port=ipc_port)
     assert res_stop is not None

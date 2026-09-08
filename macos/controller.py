@@ -234,7 +234,7 @@ class MacBridgeController:
         self._active_local_bind: Optional[str] = None
 
         # Microphone path state & desired state
-        self._microphone_desired: bool = False
+        self._microphone_desired: bool = (self._desired_state == DesiredState.ENABLED)
         self._microphone_path_state = PathState.IDLE
         self._microphone_child_pid: Optional[int] = None
         self._last_actionable_microphone_error: Optional[str] = None
@@ -702,8 +702,10 @@ class MacBridgeController:
             self._desired_state = self._load_persisted_desired_state()
             if self._desired_state == DesiredState.STOPPED_BY_USER:
                 self._controller_state = LifecycleState.STOPPED
+                self._microphone_desired = False
             else:
                 self._controller_state = LifecycleState.STARTING
+                self._microphone_desired = True
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
 
@@ -752,6 +754,7 @@ class MacBridgeController:
 
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
+            self._microphone_desired = True
             self._controller_state = LifecycleState.STARTING
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
@@ -790,6 +793,7 @@ class MacBridgeController:
         with self._lock:
             self._desired_state = DesiredState.STOPPED_BY_USER
             self._persist_desired_state(DesiredState.STOPPED_BY_USER)
+            self._microphone_desired = False
 
             # Stop owned speaker pipeline child
             spk_stopped = self._stop_child("speaker")
