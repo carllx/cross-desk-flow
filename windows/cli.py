@@ -69,8 +69,10 @@ def run_host_service():
 
     print(f"Controller host started (PID {os.getpid()})")
     try:
-        while True:
-            time.sleep(1.0)
+        while not controller.is_shutdown_requested:
+            time.sleep(0.5)
+            if controller.is_shutdown_requested:
+                break
             controller.reconcile()
     except (KeyboardInterrupt, SystemExit):
         pass
@@ -80,13 +82,6 @@ def run_host_service():
 
 
 def main():
-    from .task_scheduler import (
-        install_scheduled_task,
-        is_scheduled_task_installed,
-        reinstall_scheduled_task,
-        uninstall_scheduled_task,
-    )
-
     parser = argparse.ArgumentParser(description="desk-audio-bridge Windows controller")
     parser.add_argument(
         "command",
@@ -102,6 +97,7 @@ def main():
         return
 
     if args.command == "install":
+        from .task_scheduler import install_scheduled_task
         ok, msg = install_scheduled_task()
         if ok:
             print(f"Install successful: {msg}")
@@ -111,6 +107,7 @@ def main():
         return
 
     if args.command == "reinstall":
+        from .task_scheduler import reinstall_scheduled_task
         ok, msg = reinstall_scheduled_task()
         if ok:
             print(f"Reinstall successful: {msg}")
@@ -120,6 +117,7 @@ def main():
         return
 
     if args.command == "uninstall":
+        from .task_scheduler import uninstall_scheduled_task
         ok, msg = uninstall_scheduled_task()
         if ok:
             print(f"Uninstall successful: {msg}")
@@ -180,8 +178,13 @@ def main():
             print(f"Speaker Path State:    {status_dict.get('speaker_path_state')}")
             print(f"Speaker Port:          {status_dict.get('speaker_target_port')}")
             print(f"Owned Children Count:  {status_dict.get('owned_children_count')}")
-            task_installed = is_scheduled_task_installed()
-            print(f"Scheduled Task:        {'Installed' if task_installed else 'Not Installed'}")
+            try:
+                from .task_scheduler import is_scheduled_task_installed
+                task_installed = is_scheduled_task_installed()
+                task_str = "Installed" if task_installed else "Not Installed"
+            except Exception:
+                task_str = "Unknown (pywin32 unavailable)"
+            print(f"Scheduled Task:        {task_str}")
             if status_dict.get("last_actionable_error"):
                 print(f"Last Error:            {status_dict.get('last_actionable_error')}")
 
