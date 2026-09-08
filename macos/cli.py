@@ -112,28 +112,31 @@ def main():
     # Lifecycle management commands
     if args.command == "install":
         from .lifecycle import install_launch_agent
-        if install_launch_agent():
+        ok, err = install_launch_agent()
+        if ok:
             print("LaunchAgent installed and registered successfully")
         else:
-            print("Failed to install or bootstrap LaunchAgent", file=sys.stderr)
+            print(f"Failed to install or bootstrap LaunchAgent: {err}", file=sys.stderr)
             sys.exit(1)
         return
 
     elif args.command == "reinstall":
         from .lifecycle import reinstall_launch_agent
-        if reinstall_launch_agent():
+        ok, err = reinstall_launch_agent()
+        if ok:
             print("LaunchAgent reinstalled successfully (persisted desired state preserved)")
         else:
-            print("Failed to reinstall LaunchAgent", file=sys.stderr)
+            print(f"Failed to reinstall LaunchAgent: {err}", file=sys.stderr)
             sys.exit(1)
         return
 
     elif args.command == "uninstall":
         from .lifecycle import uninstall_launch_agent
-        if uninstall_launch_agent():
+        ok, err = uninstall_launch_agent()
+        if ok:
             print("LaunchAgent uninstalled and controller stopped successfully")
         else:
-            print("Failed to uninstall LaunchAgent", file=sys.stderr)
+            print(f"Failed to uninstall LaunchAgent: {err}", file=sys.stderr)
             sys.exit(1)
         return
 
