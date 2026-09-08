@@ -58,13 +58,19 @@ class FakeProcessRunner(ProcessRunner):
         self.started_commands.append(cmd)
         return pid
 
-    def stop_process(self, pid: int) -> None:
+    def stop_process(self, pid: int) -> bool:
         if pid in self.running_pids:
             self.running_pids.remove(pid)
         self.stopped_pids.append(pid)
+        return True
 
     def is_running(self, pid: int) -> bool:
         return pid in self.running_pids
+
+    def get_child_metadata(self, pid: int) -> Optional[dict]:
+        if pid in self.running_pids or pid in self.stopped_pids:
+            return {"pid": pid, "create_time": 1000.0}
+        return None
 
 
 class FakeDeviceResolver(MacCoreAudioDeviceResolver):
