@@ -18,7 +18,7 @@
    ```powershell
    python -m windows.cli start
    ```
-   - **行为机制**：该命令具备幂等性（Idempotent）。若后台控制器宿主进程尚未运行，它会自动在后台拉起无窗口守护控制器（`python -m windows.cli run`），随后通过本地回环 IPC (`127.0.0.1:50105`) 发送启动指令并持久化 `DesiredState: RUNNING`；若控制器已在运行，则直接恢复媒体状态。
+   - **行为机制**：该命令具备幂等性（Idempotent）。若后台控制器宿主进程尚未运行，它会自动在后台拉起无窗口守护控制器（`python -m windows.cli run`），随后通过本地回环 IPC 发送启动指令并持久化 `DesiredState: ENABLED`；若控制器已在运行，则直接恢复媒体状态。
 
 2. **状态巡检 (Status Check)**：
    ```powershell
@@ -30,7 +30,7 @@
    ```powershell
    python -m windows.cli stop
    ```
-   - **行为机制**：该命令**绝不是简单的 `taskkill` 杀进程**。它会通过 IPC 通知控制器优雅终止所拥有的媒体子进程，并在本地持久化存储写入 `DesiredState: STOPPED_BY_USER`。在用户下一次显式执行 `start` 之前，任何对端心跳或重启重连均不会偷偷恢复媒体声音传输。
+   - **行为机制**：该命令**绝不是简单的 `taskkill` 杀进程**。它会通过本地回环 IPC 通知控制器优雅终止所拥有的媒体子进程，并在本地持久化存储写入 `DesiredState: STOPPED_BY_USER`。在用户下一次显式执行 `start` 之前，任何对端心跳或重启重连均不会偷偷恢复媒体声音传输。
 
 ---
 
@@ -42,7 +42,7 @@
    ```bash
    /opt/miniconda3/bin/python -m macos.cli start
    ```
-   - **行为机制**：同样具备幂等性。若控制器未常驻，会自动拉起独立会话的后台守护进程，并通过本地回环 IPC (`127.0.0.1:50106`) 发送启动指令并设置 `DesiredState: RUNNING`。
+   - **行为机制**：同样具备幂等性。若控制器未常驻，会自动拉起独立会话的后台守护进程，并通过本地回环 IPC 发送启动指令并设置 `DesiredState: ENABLED`。
 
 2. **状态巡检 (Status Check)**：
    ```bash
@@ -53,7 +53,7 @@
    ```bash
    /opt/miniconda3/bin/python -m macos.cli stop
    ```
-   - 优雅停用 CoreAudio 扬声器接收与麦克风采集管道，将意图持久化为 `STOPPED_BY_USER`。
+   - 优雅停用 CoreAudio 扬声器接收与麦克风采集管道，将意图持久化为 `DesiredState: STOPPED_BY_USER`。
 
 ---
 
