@@ -17,6 +17,19 @@ try:
 except Exception:
     pass
 
+# Ensure stdout and stderr do not fail when run under windowless pythonw
+if sys.stdout is None:
+    try:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    except Exception:
+        pass
+
+if sys.stderr is None:
+    try:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    except Exception:
+        pass
+
 from windows.cli import run_host_service
 
 if __name__ == "__main__":

@@ -173,7 +173,14 @@ class InterfaceClassifier:
                 "-Command",
                 f"(Get-NetAdapter -InterfaceIndex (Get-NetIPAddress -IPAddress {ip_str} -ErrorAction SilentlyContinue).InterfaceIndex -ErrorAction SilentlyContinue).PhysicalMediaType",
             ]
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=8.0).strip()
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            out = subprocess.check_output(
+                cmd,
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=15.0,
+                creationflags=creationflags,
+            ).strip()
             out_lower = out.lower()
             if "802.3" in out_lower or "ethernet" in out_lower:
                 return InterfaceMedium.WIRED_ETHERNET

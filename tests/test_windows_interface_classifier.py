@@ -81,3 +81,18 @@ def test_classify_windows_other_not_cached():
             assert medium2 == InterfaceMedium.OTHER
             ps_calls2 = [c for c in mock_subproc.call_args_list if isinstance(c[0][0], list) and c[0][0][0] == "powershell.exe"]
             assert len(ps_calls2) == 2
+
+
+def test_classify_windows_uses_create_no_window():
+    """Windows classification specifies CREATE_NO_WINDOW to avoid flashing terminal windows."""
+    import subprocess
+    classifier = InterfaceClassifier()
+    _mock_check_output.ps_return = "802.3\r\n"
+    with patch.object(classifier, "_resolve_powershell_cmd", return_value="powershell.exe"):
+        with patch("subprocess.check_output", side_effect=_mock_check_output) as mock_subproc:
+            classifier.classify_interface("198.168.10.5")
+            assert mock_subproc.called
+            call_kwargs = mock_subproc.call_args[1]
+            expected_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            assert call_kwargs.get("creationflags") == expected_flag
+            assert call_kwargs.get("timeout") == 15.0
