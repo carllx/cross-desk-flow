@@ -16,15 +16,16 @@
 +-------------------------------------------------------------------------------------------------------------------------+
 | 用户端到端体感延迟 (End-to-End User Perceived Latency)                                                                  |
 +-------------------------------------------------------------+-----------------------------------------------------------+
-| 1. 物理音频传输链路 (Physical Bridge): [MEASURED]            | 2. 后端输入法/ASR 处理链路 (Post-Bridge Finalization):     |
-|    Mac 麦克风物理声学事件 -> Windows CABLE Output             |    [ESTIMATED: 约 814.67 ms (基于中位数拆解)]             |
-|    - Median: 397.45 ms                                      |    - Speech-End -> Final Text Median: 1212.12 ms          |
-|    - p95: 422.99 ms                                         |    - 包括: VAD 停顿检测窗口 (Endpointing) + 模型首字与定稿 |
+| 1. 物理音频传输链路 (Physical Bridge): [MEASURED]            | 2. Windows 输入法截断与定稿阶段                           |
+|    Mac 麦克风物理声学事件 -> Windows CABLE Output             |    (Windows input-method endpointing/finalization stage): |
+|    - Median: 397.45 ms                                      |    [ESTIMATED: 约 814.67 ms (derived from median          |
+|    - p95: 422.99 ms                                         |     subtraction)]                                         |
+|                                                             |    - Speech-End -> Final Text Median: 1212.12 ms          |
 +-------------------------------------------------------------+-----------------------------------------------------------+
 ```
 
 * **物理传输链路 (Physical Bridge)**：真实延迟约为 **397.45 ms**（状态：`MEASURED`），远低于用户感知的数秒级延迟。
-* **后段处理链路 (Post-Bridge Endpointing / Finalization)**：占据了正常发音结束到最终文字落盘的主要耗时（状态：`ESTIMATED`，约 **814.67 ms**）。
+* **后段输入法处理链路 (Post-Bridge Windows input-method endpointing/finalization stage)**：占据了正常发音结束到最终文字落盘的主要耗时（状态：`ESTIMATED`，约 **814.67 ms**，derived from median subtraction）。
 * **初始 3.84s / 16.46s 异常长尾现象**：经离线语义审计，确认为早期索引错位与事件匹配 artifact，而非真实系统的稳态物理延迟。
 
 ---
@@ -70,10 +71,10 @@
 * **尾部伪影排除**: 早期统计中出现的 3.84 s 与 16.46 s 极大值，经事件时间轴核验，为未对齐索引跨段匹配导致的假象（Index/Join Artifact），真实物理系统不存在该异常延迟尾部。
 
 ### C. 流式识别特征 (Streaming Behavior)
-在全部 8 / 8 个测试语段中，文字均在用户说话尚未结束时就已经开始流式上屏：
+在全部 8 / 8 个测试语段中，文字均在用户说话尚未结束时就已经开始流式上屏（8/8 utterances began showing text before physical speech end, consistent with streaming recognition）：
 * **首字出现相对于发音结束的时间差 (Text Started Relative to Speech-End)**:
   `[-2860.4, -1784.4, -1677.4, -2465.4, -2398.4, -3634.4, -1643.4, -939.4] ms`
-* **分析说明**：负值表明现代输入法 ASR 引擎具备全双工流式预测（Streaming Recognition）能力。因此，“用户发音结束后多长时间出现第一个字”不再适合作评估端到端真实延迟的基准指标。
+* **分析说明**：负值表明输入法具备流式识别（streaming recognition）能力，用户物理发音结束前已持续产生中间识别结果。因此，“用户发音结束后多长时间出现第一个字”不再适合作评估端到端真实延迟的基准指标。
 
 ### D. 发音结束至最终文字稳定时间 (Speech-End -> Final Text Stabilization)
 评估语音输入体验的核心指标是：用户物理停止说话（Speech End）到屏幕上文字最终定稿稳定（Final Text Event）的时间间隔。
@@ -97,10 +98,12 @@
 
 $$\text{Post-Bridge Latency} = \text{Speech-End to Final Median} (1212.12\text{ ms}) - \text{Phase E Physical Bridge Median} (397.45\text{ ms}) \approx 814.67\text{ ms}$$
 
-* **状态标记**: `ESTIMATED`（估算值，因为 Phase F-C 测试为保证纯粹的真实输入法行为，未对相同语段同步在 Windows 底层插桩二次采集 CABLE Output）。
+* **状态标记**: `ESTIMATED`
+  * The post-bridge Windows input-method endpointing/finalization component is ESTIMATED at ~814.67 ms median (derived from median subtraction).
+  * 估算原因为 Phase F-C 测试保持真实输入法环境，未对相同语段同步在底层并发采集 CABLE Output。
 * **工程结论**:
-  * Windows 侧输入法的静音截断策略与定稿阶段（Input-method endpointing / finalization stage）构成了发音结束到文字稳定落盘的主要耗时成分（约 814.67 ms，占总耗时约 67%）。
-  * **限制说明**：本测试严禁在无证据前提下推断“云端 ASR 自身为绝对主要瓶颈”（Cloud ASR itself was measured and is the dominant cause），因为云端传输与模型内部黑盒细节在此阶段未被直接插桩观测。
+  * Windows 输入法截断与定稿阶段（Windows input-method endpointing/finalization stage）构成了发音结束到文字稳定落盘的主要耗时成分（约 814.67 ms，基于中位数差值估算约占 67%）。
+  * **限制说明**：本测试严禁在无证据前提下推断“云端 ASR 自身为绝对主要瓶颈”（Cloud ASR itself was measured and is the dominant cause），因为云端传输与模型内部黑盒细节在此阶段未被直接插桩观测。不对 endpointing/finalization 内部细节做未经测量的细分推测。
 
 ---
 
