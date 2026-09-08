@@ -391,9 +391,13 @@ class MacBridgeController:
         """Removes a stopped child from journal only after its death is confirmed.
         
         Clears the journal file ONLY when no children remain.
+        Fails closed (returns False) if journal cannot be read due to corruption/error.
         """
         journal, err = self._load_ownership_journal()
-        if not journal or err:
+        if err:
+            logger.error("Cannot record child stopped because journal is corrupt or unreadable: %s", err)
+            return False
+        if not journal:
             return True
         if "children" in journal:
             journal["children"].pop(role, None)
@@ -1019,13 +1023,21 @@ class MacBridgeController:
             self._speaker_child_pid = pid
             journal_ok = self._record_child_started("speaker", pid, cmd, DEFAULT_SPEAKER_RTP_PORT)
             if not journal_ok:
-                err_msg = "Failed to atomically record speaker child in ownership journal; failing closed"
-                logger.error(err_msg)
-                self.process_runner.stop_process(pid)
-                self._speaker_child_pid = None
-                self._speaker_path_state = PathState.FAILED
-                self._controller_state = LifecycleState.ERROR
-                self._last_actionable_error = err_msg
+                cleanup_ok = self.process_runner.stop_process(pid)
+                if cleanup_ok:
+                    self._speaker_child_pid = None
+                    self._speaker_path_state = PathState.FAILED
+                    self._controller_state = LifecycleState.ERROR
+                    self._last_actionable_error = "Failed to atomically record speaker child in ownership journal; failing closed"
+                else:
+                    self._speaker_path_state = PathState.FAILED
+                    self._controller_state = LifecycleState.ERROR
+                    err_msg = (
+                        f"Failed to atomically record speaker child in ownership journal, and "
+                        f"spawned child [PID {pid}] cleanup could not be confirmed"
+                    )
+                    self._last_actionable_error = err_msg
+                    logger.error(err_msg)
                 return
 
             self._active_peer_address = self.discovery_service.peer_address
@@ -1108,12 +1120,20 @@ class MacBridgeController:
             self._microphone_child_pid = pid
             journal_ok = self._record_child_started("microphone", pid, cmd, DEFAULT_MIC_RTP_PORT)
             if not journal_ok:
-                err_msg = "Failed to atomically record microphone child in ownership journal; failing closed"
-                logger.error(err_msg)
-                self.process_runner.stop_process(pid)
-                self._microphone_child_pid = None
-                self._microphone_path_state = PathState.FAILED
-                self._last_actionable_microphone_error = err_msg
+                cleanup_ok = self.process_runner.stop_process(pid)
+                if cleanup_ok:
+                    self._microphone_child_pid = None
+                    self._microphone_path_state = PathState.FAILED
+                    self._last_actionable_microphone_error = "Failed to atomically record microphone child in ownership journal; failing closed"
+                else:
+                    self._microphone_path_state = PathState.FAILED
+                    self._controller_state = LifecycleState.ERROR
+                    err_msg = (
+                        f"Failed to atomically record microphone child in ownership journal, and "
+                        f"spawned child [PID {pid}] cleanup could not be confirmed"
+                    )
+                    self._last_actionable_microphone_error = err_msg
+                    logger.error(err_msg)
                 return
 
             self._microphone_path_state = PathState.RUNNING

@@ -1148,5 +1148,245 @@ def test_stopped_by_user_reconcile_success_sets_both_stopped_and_controller_stop
     ctrl.shutdown()
 
 
+def test_record_child_stopped_journal_read_error_returns_false(isolated_env, monkeypatch):
+    """Correction 1: If child death is confirmed but _load_ownership_journal returns an error
+    (e.g. corrupt or unreadable journal), _record_child_stopped must return False,
+    causing _stop_child to return False and prevent claiming clean STOPPED.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    proc = subprocess.Popen(
+        ["sleep", "10"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    ctrl._speaker_child_pid = proc.pid
+
+    # Simulate journal read error from corrupt/unreadable file
+    monkeypatch.setattr(ctrl, "_load_ownership_journal", lambda: (None, "Corrupt journal error"))
+
+    # Child is dead after stop_process, but journal load returns error
+    assert ctrl._record_child_stopped("speaker") is False
+    assert ctrl._stop_child("speaker") is False
+    assert ctrl._speaker_path_state.value == "FAILED"
+    assert "ownership journal" in (ctrl._last_actionable_error or "").lower()
+
+    # Reconcile under STOPPED_BY_USER must NOT claim clean STOPPED
+    ctrl._desired_state = DesiredState.STOPPED_BY_USER
+    ctrl.reconcile()
+    status = ctrl.get_status()
+    assert status.controller_state == "ERROR"
+    assert status.speaker_path_state == "FAILED"
+
+    ctrl.shutdown()
+
+
+def test_speaker_journal_start_failure_cleanup_success(isolated_env, monkeypatch):
+    """Correction 2: Speaker journal-start failure with successful cleanup:
+    PID must be cleared, path marked FAILED, controller ERROR, and actionable journal error exposed.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = True
+        peer_address = "127.0.0.1"
+        local_bind_address = "127.0.0.1"
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    # Simulate journal start recording failure
+    monkeypatch.setattr(ctrl, "_record_child_started", lambda role, pid, cmd, port: False)
+
+    ctrl.start()
+
+    status = ctrl.get_status()
+    assert status.speaker_path_state == "FAILED"
+    assert status.controller_state == "ERROR"
+    assert ctrl._speaker_child_pid is None
+    assert "Failed to atomically record speaker child in ownership journal" in (status.last_actionable_error or "")
+
+    ctrl.shutdown()
+
+
+def test_speaker_journal_start_failure_cleanup_failure(isolated_env, monkeypatch):
+    """Correction 2: Speaker journal-start failure with cleanup failure:
+    Exact PID must be retained in memory, path FAILED, controller ERROR,
+    and actionable error must report BOTH journal persistence failure AND cleanup failure.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = True
+        peer_address = "127.0.0.1"
+        local_bind_address = "127.0.0.1"
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    # Simulate journal start recording failure
+    monkeypatch.setattr(ctrl, "_record_child_started", lambda role, pid, cmd, port: False)
+    # Simulate cleanup failure: stop_process returns False (cannot confirm death)
+    monkeypatch.setattr(ctrl.process_runner, "stop_process", lambda pid: False)
+
+    ctrl.start()
+
+    status = ctrl.get_status()
+    assert status.speaker_path_state == "FAILED"
+    assert status.controller_state == "ERROR"
+    assert ctrl._speaker_child_pid is not None
+    assert "Failed to atomically record speaker child in ownership journal" in (status.last_actionable_error or "")
+    assert "cleanup could not be confirmed" in (status.last_actionable_error or "")
+
+    # Cleanup the actual spawned process
+    if ctrl._speaker_child_pid and psutil.pid_exists(ctrl._speaker_child_pid):
+        try:
+            os.kill(ctrl._speaker_child_pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    ctrl.shutdown()
+
+
+def test_microphone_journal_start_failure_cleanup_success(isolated_env, monkeypatch):
+    """Correction 2: Microphone journal-start failure with successful cleanup:
+    PID must be cleared, path marked FAILED, and actionable microphone error exposed.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = True
+        peer_address = "127.0.0.1"
+        local_bind_address = "127.0.0.1"
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    # Enable controller
+    ctrl.start()
+
+    # Set microphone desired
+    ctrl._microphone_desired = True
+    monkeypatch.setattr(ctrl, "_record_child_started", lambda role, pid, cmd, port: False)
+
+    ctrl.reconcile()
+
+    status = ctrl.get_status()
+    assert status.microphone_path_state == "FAILED"
+    assert ctrl._microphone_child_pid is None
+    assert "Failed to atomically record microphone child in ownership journal" in (status.last_actionable_microphone_error or "")
+
+    ctrl.shutdown()
+
+
+def test_microphone_journal_start_failure_cleanup_failure(isolated_env, monkeypatch):
+    """Correction 2: Microphone journal-start failure with cleanup failure:
+    Exact PID must be retained in memory, path FAILED, controller ERROR,
+    and actionable microphone error must report BOTH journal persistence failure AND cleanup failure.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    class FakeDiscovery:
+        peer_available = True
+        peer_address = "127.0.0.1"
+        local_bind_address = "127.0.0.1"
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    ctrl.discovery_service = FakeDiscovery()
+    assert ctrl.start_host()
+
+    ctrl.start()
+    ctrl._microphone_desired = True
+    # Simulate journal start recording failure
+    monkeypatch.setattr(ctrl, "_record_child_started", lambda role, pid, cmd, port: False)
+    # Simulate cleanup failure: stop_process returns False (cannot confirm death)
+    monkeypatch.setattr(ctrl.process_runner, "stop_process", lambda pid: False)
+
+    ctrl.reconcile()
+
+    status = ctrl.get_status()
+    assert status.microphone_path_state == "FAILED"
+    assert status.controller_state == "ERROR"
+    assert ctrl._microphone_child_pid is not None
+    assert "Failed to atomically record microphone child in ownership journal" in (status.last_actionable_microphone_error or "")
+    assert "cleanup could not be confirmed" in (status.last_actionable_microphone_error or "")
+
+    # Cleanup the actual spawned process
+    if ctrl._microphone_child_pid and psutil.pid_exists(ctrl._microphone_child_pid):
+        try:
+            os.kill(ctrl._microphone_child_pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    ctrl.shutdown()
+
+
+
 
 
