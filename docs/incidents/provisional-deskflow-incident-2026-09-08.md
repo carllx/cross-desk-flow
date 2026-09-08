@@ -66,11 +66,17 @@
    * 双端零剪贴板事件，网络信道仅交换屏幕切换信息，无 CPU 尖峰。
    * Windows 端确认已开启剪贴板历史记录（`HKCU:\Software\Microsoft\Clipboard\EnableClipboardHistory = 1`）。
 2. **受控单次传递 (Single Copy Test)**：
-   * macOS 端临时开启剪贴板共享，在 Mac 上单次复制唯一纯文本 Token `CLIP_TEST_20260908_A`（未进行二次复制，无富文本/图像）。
-   * **用户 UI 观测**：Windows 端打开 `Win + V` 剪贴板历史，目标 Token **精确出现 1 次**，粘贴至 Notepad 内容完整无误。
-   * **底层日志观测**：Windows 端在 8 秒内记录了 13 次密集 `INFO: clipboard was updated`（包含同毫秒 3 连发特征）；macOS Server 观测到来自 Windows 的回弹消息并提示 `mis-sequenced` 后将其丢弃（ignored）。
-   * **性能与稳定性**：测试期间 `deskflow-core.exe` CPU 仍维持 0.00%，内存约 14.61 MB，系统 UI 流畅，未引发历史风暴现象。
-   * **测试后处置**：验证完毕后两端已立即将 Clipboard Sharing 重新置为 **OFF**。
+   * macOS 端临时开启剪贴板共享，并在 Mac 端确认执行了一次唯一的纯文本 Token 复制（时间戳 `09:29:56.705`）：`CLIP_TEST_20260908_A`（未主动进行二次复制，无富文本/图像）。
+   * **用户 UI 观测 (Single Token Delivery)**：
+     * Delivered: **YES**
+     * Windows 端呼出 `Win + V` 剪贴板历史，目标 Token **精确仅出现 1 次**。
+     * 粘贴至普通 Notepad 验证内容完整准确。
+   * **日志与网络传输观测 (Update Attribution Discipline)**：
+     * Windows 端在剪贴板共享启用与配置重载测试窗口期间（`09:28:27–09:28:35`）记录到一次 13-entry 的 `INFO: clipboard was updated` 爆发更新（含同毫秒 3 连发特征）。
+     * **严格证据归因**：由于该 13 次更新的时间戳（`09:28:27–09:28:35`）先于 macOS 实际触发唯一 Token 复制的时间戳（`09:29:56.705`），**两者时间未对齐，严禁将该 13-entry burst 归因于本次单次复制**。不得将其记录为“Verified single-copy feedback loop”。
+     * macOS Server 确实观测到了来自 Windows 的网络回弹，但已将其标记为 `mis-sequenced` 并成功予以忽略（ignored）。
+   * **性能与稳定性**：测试期间 `deskflow-core.exe` CPU 持续维持 0.00%，内存稳定在约 14.61 MB，系统 UI 无卡顿，无 deadlock，无 `0xc0000409` 崩溃。
+   * **测试后处置**：验证完毕后两端已立即恢复为 **Clipboard Sharing = OFF**。
 
 ---
 
@@ -86,19 +92,27 @@
 
 * **Root Cause**: `Not fully verified`
 * **事实与推论区分**：
-  * *Verified Fact*：在当前单一官方 MSI + 正常运行的 Service Mode 纯净环境下，单次纯文本传输不会在 Windows `Win + V` 历史中留下重复条目，未复现历史严重卡顿与性能衰退。
-  * *Verified Fact*：Deskflow 底层协议在处理剪贴板更新时存在短时间内的多次并发重发（burst）与双向回弹（rebound），依赖服务端 sequence 校验进行静默丢弃。
-  * *Inferred (未经验证的推论)*：历史环境中同时存在的 Portable 便携版与 MSI 安装版、或多次重启未清理干净的僵尸 core/GUI 进程，可能因多实例争抢操作系统剪贴板监听器（Clipboard Format Listener）而形成了恶性事件自激环路（Feedback Loop）。但**严禁**将“便携版残留即剪贴板风暴根因”视为已被证实的事实。
+  * *Verified Fact*：在当前单一官方 MSI + 正常运行的 Service Mode 纯净环境下，单次纯文本传输在 Windows `Win + V` 历史中仅显示 1 条，未复现历史严重卡顿与性能衰退。
+  * *Verified Fact*：macOS Server 观测到来自 Windows 的回弹消息并标记为 `mis-sequenced` 忽略；Windows 端在测试窗口记录过 13-entry burst 但与本次 Token 复制时间未对齐。
+  * *Verified Fact*：历史剪贴板风暴（单次复制出现 8–10 条重复并持续累积卡死）在当前纯净拓扑下未复现，其根因依然为 `Not fully verified`。
+  * *Inferred (未经验证的推论)*：早期环境中同时存在的 Portable 便携版与 MSI 安装版混部、或多次重启未清理干净的进程残留，可能曾影响剪贴板监听行为并促发历史风暴，但这**仅为推论**，严禁声称 Portable + MSI 混部已被证明是剪贴板风暴根因。
 
 ---
 
 ## 5. Resolution
 
-1. **彻底清理双重部署残留**：清理 `%LOCALAPPDATA%\Programs\Deskflow` 历史便携文件，固定所有桌面和系统入口指向官方 MSI 安装路径。
-2. **保持 Windows Service 持续启用**：确保 Windows `Deskflow` 服务处于 `Automatic` 且为 `Running` 状态，由 Session 0 守护进程管理 elevated core。
-3. **保持普通用户 GUI 运行**：日常使用无需也不得以管理员身份启动 `deskflow.exe`，避免破坏权限隔离模型。
-4. **剪贴板共享策略收敛**：在 Deskflow 剪贴板双向同步机制与回弹抑制逻辑获得上游完全解释前，日常保持 **Clipboard Sharing = OFF**，杜绝潜在风暴风险。
-5. **TLS 持续加固**：保持传输信道 TLS 加密开启。
+### A. UAC 最终修复 (UAC Final Fix)
+本次调查真正闭环并生效的最小修复为：
+1. **服务状态恢复**：将 Windows `Deskflow` 服务的运行状态从 `Stopped` 恢复为 `Running`（启动类型保持 `Automatic`）。
+2. **特权守护路径建立**：由 SCM 在 Session 0 建立 `LocalSystem` 权限的 `deskflow-daemon.exe` 守护进程。
+3. **特权 Core 托管派生**：由 daemon 主动向用户会话（Session 1）派生拥有 `SYSTEM` 特权的 watchdog core（`deskflow-core.exe`）。
+4. **标准权限 GUI 维持**：桌面 GUI（`deskflow.exe`）保持普通用户权限（`Medium Mandatory Level`）运行，无需管理员提权即可由特权 core 接管 UAC / Secure Desktop。
+
+### B. 相关环境与安全状态（非本次修复动作）
+以下项目为本次排查的相关事实或当前防护策略，**不得混同为本次 UAC 的 Resolution 步骤**：
+* **Deployment Hygiene（前期部署清理事实）**：清理 `%LOCALAPPDATA%\Programs\Deskflow` 历史便携残留属于排查前已完成的环境清理事实，非本次 UAC 最终生效的修改。
+* **Containment（当前安全收敛状态）**：在 Deskflow 剪贴板双向更新与回弹逻辑获得彻底解释前，维持 **Clipboard Sharing = OFF** 属于控制风险的当前安全状态，并非对剪贴板风暴的根因修复。
+* **Unchanged Security Baseline（未变更安全基线）**：传输信道 TLS 加密全程保持启用，未作为解决 UAC 的变通手段被修改。
 
 ---
 
@@ -122,7 +136,7 @@
    ```powershell
    Get-Service Deskflow | Select-Object Name, Status, StartType
    ```
-   *若为 `Stopped`，普通桌面可用但 UAC 必挂。启动服务必须具备管理员特权，普通用户执行 `Start-Service` 会直接报错 `Access Denied`。*
+   *在本起故障中，`Deskflow` 服务处于 `Stopped` 状态直接关联到特权 daemon/core 路径缺失与 UAC 控制失效（In this incident, Service Stopped correlated with absence of the privileged daemon/core path and UAC failure）。启动服务必须具备管理员特权，普通用户执行 `Start-Service` 会直接报错 `Access Denied`。*
 2. **检查跨 Session 进程拓扑**：
    ```powershell
    Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^deskflow' } |
@@ -146,7 +160,7 @@
 | **软件版本** | 当前部署为 Deskflow 1.26.0.0 MSI | 安装来源应单一，避免便携版与安装版混部 | **禁止**将 1.26.0.0 锁定为仓库终身依赖版本 |
 | **剪贴板共享** | 当前两端均配置为主动关闭 (OFF) | 协议回弹未完全阐明前保持关闭以保稳定 | **禁止**将“永久禁用剪贴板”定性为最终架构设计 |
 | **设备角色** | macOS 为 Server，Windows 为 Client | 键盘鼠标源主机为 Server，受控端为 Client | **禁止**假定未来不可切换对调 Server/Client 角色 |
-| **权限模型** | Service 以 LocalSystem 运行于 Session 0 | UAC 注入需要特权服务代理，GUI 维持低权限 | **禁止**采用“永久管理员运行 GUI”等旁路方案 |
+| **权限模型** | Service 以 LocalSystem 运行于 Session 0 | UAC 注入需要特权服务代理；本次故障无需将 GUI 永久设为管理员运行，普通用户 GUI 配合健康的 Service Mode 即可通过 Human Gate（This incident did not require permanently elevating the GUI; ordinary-user GUI + healthy Service Mode passed the Human Gate） | **禁止**将特定权限临时绕行手段升级为全局架构规范，亦不得强加“GUI 永远不得管理员运行”等脱离上下文的全局禁令 |
 | **系统协作** | 当前开发机日常使用 Deskflow | 键鼠网络与音频网络彼此独立 | **禁止**将 Deskflow 纳入音频系统控制或配置中心 |
 
 ---
@@ -179,6 +193,6 @@
 
 * **排查对象**: Windows Deskflow UAC 失效与剪贴板风暴风险
 * **UAC 根因判定**: `Verified Root Cause: Windows Deskflow Service / privileged daemon path was not active.`
-* **剪贴板根因判定**: `Root Cause: Not fully verified` (历史单次复制产生 8-10 条重复的风暴现象在本次纯净拓扑下未复现；协议层存在 13 次爆发更新与回弹丢弃，当前策略收敛为维持关闭)
+* **剪贴板根因判定**: `Root Cause: Not fully verified`（测试窗口内的 13-entry burst 因时间戳未对齐不得归因于单次 Token 复制；历史严重风暴在当前纯净拓扑下未复现，Token 单次送达 Win+V 且仅显示 1 条；当前维持 `Clipboard Sharing = OFF` 作为安全收敛）
 * **Human Gate 验证**: 全部 **PASS**（管理员终端可用，UAC 安全桌面可用，测试 Token 精确单次抵达）
 * **系统变更状态**: 现场保持纯净 Service Mode 运行，未修改底层 UAC/安全策略，未修改音频核心代码。
