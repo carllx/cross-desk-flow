@@ -342,11 +342,20 @@ def test_command_signature_mismatch_not_touched(isolated_env):
             lock_port=lock_port,
             ipc_port=ipc_port,
         )
-        assert ctrl.start_host()
+        # Fail-closed: controller must refuse to start because an unverified process occupies the journal entry
+        assert not ctrl.start_host()
+        assert ctrl.get_status().controller_state == "ERROR"
+        assert "failed identity verification" in (ctrl.get_status().last_actionable_error or "")
 
         time.sleep(0.5)
         assert psutil.pid_exists(py_pid), "Non-GStreamer process must NOT be touched by recovery!"
         assert py_proc.poll() is None
+
+        # Journal must retain the unresolved child entry
+        with open(journal_file, "r", encoding="utf-8") as f:
+            j_data = json.load(f)
+        assert "speaker" in j_data.get("children", {})
+        assert j_data["children"]["speaker"]["pid"] == py_pid
 
         ctrl.shutdown()
     finally:
@@ -419,3 +428,270 @@ def test_desired_state_persistence_remains_unchanged(isolated_env):
     assert data2["desired_state"] == DesiredState.STOPPED_BY_USER.value
 
     ctrl.shutdown()
+
+
+def test_verified_child_termination_failure_retains_journal_and_fails_closed(isolated_env, monkeypatch):
+    """Browser Review Requirement 1: If termination of a verified child fails/times out,
+    the journal record MUST be retained, controller startup MUST fail-closed, and an actionable error is exposed.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    proc = subprocess.Popen(
+        [GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = proc.pid
+    time.sleep(0.5)
+    assert psutil.pid_exists(pid)
+
+    try:
+        p = psutil.Process(pid)
+        stale_journal = {
+            "version": 1,
+            "owner_pid": 9999999,
+            "owner_create_time": 1000.0,
+            "children": {
+                "speaker": {
+                    "role": "speaker",
+                    "pid": pid,
+                    "create_time": p.create_time(),
+                    "port": 5004,
+                    "cmd_tokens": [GST_BIN, "-m", "udpsrc", "port=5004"],
+                }
+            },
+        }
+        with open(journal_file, "w", encoding="utf-8") as f:
+            json.dump(stale_journal, f)
+
+        ctrl = MacBridgeController(
+            state_file=state_file,
+            journal_file=journal_file,
+            lock_port=lock_port,
+            ipc_port=ipc_port,
+        )
+
+        # Simulate termination failure: _terminate_stale_child returns False
+        monkeypatch.setattr(ctrl, "_terminate_stale_child", lambda c_pid, c_info: False)
+
+        # Controller host start must fail closed
+        assert not ctrl.start_host()
+        assert ctrl.get_status().controller_state == "ERROR"
+        assert f"Failed to terminate orphaned speaker child [PID {pid}]" in (ctrl.get_status().last_actionable_error or "")
+
+        # Journal file must NOT be cleared; unresolved child must remain recorded
+        with open(journal_file, "r", encoding="utf-8") as f:
+            j_data = json.load(f)
+        assert "speaker" in j_data.get("children", {})
+        assert j_data["children"]["speaker"]["pid"] == pid
+
+        ctrl.shutdown()
+    finally:
+        proc.kill()
+        proc.wait(timeout=2.0)
+
+
+def test_unverified_live_pid_retained_and_fails_closed(isolated_env):
+    """Browser Review Requirement 2: If an existing process cannot be verified as our child,
+    it must NOT be touched, its record MUST be retained in the journal, and startup MUST fail-closed.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    py_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    py_pid = py_proc.pid
+    time.sleep(0.5)
+    assert psutil.pid_exists(py_pid)
+
+    try:
+        p = psutil.Process(py_pid)
+        stale_journal = {
+            "version": 1,
+            "owner_pid": 9999999,
+            "owner_create_time": 1000.0,
+            "children": {
+                "microphone": {
+                    "role": "microphone",
+                    "pid": py_pid,
+                    "create_time": p.create_time(),
+                    "port": 5006,
+                    "cmd_tokens": ["nonexistent_pipeline_signature"],
+                }
+            },
+        }
+        with open(journal_file, "w", encoding="utf-8") as f:
+            json.dump(stale_journal, f)
+
+        ctrl = MacBridgeController(
+            state_file=state_file,
+            journal_file=journal_file,
+            lock_port=lock_port,
+            ipc_port=ipc_port,
+        )
+
+        assert not ctrl.start_host()
+        assert ctrl.get_status().controller_state == "ERROR"
+        assert "failed identity verification" in (ctrl.get_status().last_actionable_error or "")
+
+        # Target process must NOT be killed
+        assert psutil.pid_exists(py_pid)
+        assert py_proc.poll() is None
+
+        # Journal must retain unresolved entry
+        with open(journal_file, "r", encoding="utf-8") as f:
+            j_data = json.load(f)
+        assert "microphone" in j_data.get("children", {})
+        assert j_data["children"]["microphone"]["pid"] == py_pid
+
+        ctrl.shutdown()
+    finally:
+        py_proc.kill()
+        py_proc.wait(timeout=2.0)
+
+
+def test_journal_write_failure_terminates_spawned_child_and_fails_path(isolated_env, monkeypatch):
+    """Browser Review Requirement 3: If journal write fails when starting a child process,
+    the newly spawned process must immediately be killed, path marked FAILED, and error exposed.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    class FakeDiscovery:
+        peer_available = True
+        peer_address = "127.0.0.1"
+        local_bind_address = "127.0.0.1"
+        peer_speaker_port = 5004
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl.discovery_service = FakeDiscovery()
+
+    # Simulate atomic journal write failure
+    monkeypatch.setattr(ctrl, "_write_ownership_journal", lambda data: False)
+
+    ctrl.start()
+
+    # Speaker path must fail, not RUNNING
+    status = ctrl.get_status()
+    assert status.speaker_path_state == "FAILED"
+    assert "ownership journal" in (status.last_actionable_error or "").lower()
+
+    # Ensure no lingering child process
+    assert ctrl._speaker_child_pid is None
+    assert status.owned_children_count == 0
+
+    ctrl.shutdown()
+
+
+def test_corrupt_existing_journal_fails_closed_and_retains_file(isolated_env):
+    """Browser Review Requirement 4: Corrupt/unparseable journal must fail-closed,
+    refuse to start the controller host, not delete the corrupt file, and expose an actionable error.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    corrupt_content = '{"version": 1, "children": {"speaker": {INVALID_JSON'
+    with open(journal_file, "w", encoding="utf-8") as f:
+        f.write(corrupt_content)
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+
+    # Controller must refuse to start
+    assert not ctrl.start_host()
+    assert ctrl.get_status().controller_state == "ERROR"
+    assert "corrupt" in (ctrl.get_status().last_actionable_error or "").lower()
+
+    # Corrupt file must be preserved for investigation
+    assert os.path.exists(journal_file)
+    with open(journal_file, "r", encoding="utf-8") as f:
+        assert f.read() == corrupt_content
+
+    ctrl.shutdown()
+
+
+def test_successful_verified_recovery_clears_journal(isolated_env):
+    """Browser Review Requirement 5: When all stale owned processes are verified and cleanly terminated,
+    the journal file MUST be cleanly unlinked/emptied, allowing healthy start.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    proc = subprocess.Popen(
+        [GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = proc.pid
+    time.sleep(0.5)
+    assert psutil.pid_exists(pid)
+
+    p = psutil.Process(pid)
+    stale_journal = {
+        "version": 1,
+        "owner_pid": 9999999,
+        "owner_create_time": 1000.0,
+        "children": {
+            "speaker": {
+                "role": "speaker",
+                "pid": pid,
+                "create_time": p.create_time(),
+                "port": 5004,
+                "cmd_tokens": [GST_BIN, "-m", "udpsrc", "port=5004"],
+            }
+        },
+    }
+    with open(journal_file, "w", encoding="utf-8") as f:
+        json.dump(stale_journal, f)
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+
+    # Recovery must succeed cleanly
+    assert ctrl.start_host()
+    assert ctrl.get_status().controller_state in ("RUNNING", "READY", "IDLE")
+
+    # The stale process must be dead
+    time.sleep(0.5)
+    assert not psutil.pid_exists(pid)
+
+    # The journal must be cleared/unlinked
+    assert not os.path.exists(journal_file)
+
+    ctrl.shutdown()
+
+

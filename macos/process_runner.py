@@ -50,13 +50,12 @@ class MacOwnedProcessRunner(ProcessRunner):
         logger.info("Started owned child process [PID %d]: %s", pid, cmd[0])
         return pid
 
-    def stop_process(self, pid: int) -> None:
-        """Stops ONLY the specific owned process by PID / PGID."""
-        proc = self._owned_processes.pop(pid, None)
-        self._owned_metadata.pop(pid, None)
+    def stop_process(self, pid: int) -> bool:
+        """Stops ONLY the specific owned process by PID / PGID. Returns True if confirmed stopped."""
+        proc = self._owned_processes.get(pid)
         if not proc:
             logger.debug("PID %d is not in owned processes map; ignoring", pid)
-            return
+            return True
 
         # Attempt graceful termination via PGID / process
         try:
@@ -84,7 +83,16 @@ class MacOwnedProcessRunner(ProcessRunner):
             except Exception:
                 pass
 
-        logger.info("Stopped owned child process [PID %d]", pid)
+        # Verify whether the process is dead
+        if proc.poll() is not None:
+            self._owned_processes.pop(pid, None)
+            self._owned_metadata.pop(pid, None)
+            logger.info("Stopped owned child process [PID %d]", pid)
+            return True
+
+        logger.error("Failed to terminate owned child process [PID %d]; still alive", pid)
+        return False
+
 
     def is_running(self, pid: int) -> bool:
         """Checks whether the owned process is still running."""

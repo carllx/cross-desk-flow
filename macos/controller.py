@@ -18,7 +18,7 @@ import socket
 import sys
 import threading
 import time
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from bridge_core.contract import (
     DEFAULT_LOCAL_IPC_PORT,
@@ -247,36 +247,52 @@ class MacBridgeController:
             on_peer_discovered=self._on_peer_discovered,
         )
 
-    def _load_ownership_journal(self) -> Optional[dict]:
+    def _load_ownership_journal(self) -> Tuple[Optional[dict], Optional[str]]:
+        """Loads ownership journal.
+        
+        Returns:
+            (journal_dict, None) if journal exists and is valid.
+            (None, None) if journal file is absent.
+            (None, error_str) if journal file exists but is corrupt / unreadable.
+        """
         if not os.path.exists(self.journal_file):
-            return None
+            return None, None
         try:
             with open(self.journal_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if not isinstance(data, dict):
+                    return None, f"Corrupt ownership journal: expected JSON object, got {type(data).__name__}"
+                return data, None
         except Exception as exc:
-            logger.debug("Failed to read ownership journal %s: %s", self.journal_file, exc)
-            return None
+            err_msg = f"Corrupt or unreadable ownership journal at {self.journal_file}: {exc}"
+            logger.error(err_msg)
+            return None, err_msg
 
-    def _write_ownership_journal(self, data: dict) -> None:
-        """Atomically writes ownership journal to prevent corruption."""
+    def _write_ownership_journal(self, data: dict) -> bool:
+        """Atomically writes ownership journal. Raises or returns False on failure."""
         try:
             os.makedirs(os.path.dirname(self.journal_file), exist_ok=True)
             tmp_path = f"{self.journal_file}.tmp.{os.getpid()}"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f)
             os.replace(tmp_path, self.journal_file)
+            return True
         except Exception as exc:
-            logger.warning("Failed to write ownership journal: %s", exc)
+            logger.error("Failed to write ownership journal %s: %s", self.journal_file, exc)
+            return False
 
-    def _clear_ownership_journal(self) -> None:
+    def _clear_ownership_journal(self) -> bool:
         """Removes the ownership journal file cleanly."""
         try:
             if os.path.exists(self.journal_file):
                 os.remove(self.journal_file)
+            return True
         except Exception as exc:
-            logger.debug("Failed to remove ownership journal: %s", exc)
+            logger.warning("Failed to remove ownership journal %s: %s", self.journal_file, exc)
+            return False
 
-    def _record_child_started(self, role: str, pid: int, cmd: List[str], port: int) -> None:
+    def _record_child_started(self, role: str, pid: int, cmd: List[str], port: int) -> bool:
+        """Records child startup in journal. Returns True on success; False if journal write fails."""
         create_time = None
         try:
             import psutil
@@ -291,12 +307,18 @@ class MacBridgeController:
         except Exception:
             pass
 
-        journal = self._load_ownership_journal() or {
-            "version": 1,
-            "owner_pid": os.getpid(),
-            "owner_create_time": owner_create_time,
-            "children": {},
-        }
+        journal, err = self._load_ownership_journal()
+        if err:
+            logger.error("Cannot record child started because journal is corrupt: %s", err)
+            return False
+
+        if not journal:
+            journal = {
+                "version": 1,
+                "owner_pid": os.getpid(),
+                "owner_create_time": owner_create_time,
+                "children": {},
+            }
         journal["owner_pid"] = os.getpid()
         journal["owner_create_time"] = owner_create_time
         if "children" not in journal:
@@ -309,82 +331,73 @@ class MacBridgeController:
             "port": port,
             "cmd_tokens": cmd,
         }
-        self._write_ownership_journal(journal)
+        return self._write_ownership_journal(journal)
 
     def _record_child_stopped(self, role: str) -> None:
-        journal = self._load_ownership_journal()
-        if journal and "children" in journal:
+        """Removes a stopped child from journal only after its death is confirmed."""
+        journal, err = self._load_ownership_journal()
+        if not journal or err:
+            return
+        if "children" in journal:
             journal["children"].pop(role, None)
             if not journal["children"]:
                 self._clear_ownership_journal()
             else:
                 self._write_ownership_journal(journal)
 
-    def _verify_child_identity(self, pid: int, child_info: dict) -> bool:
+    def _verify_child_identity(self, pid: int, child_info: dict) -> Tuple[bool, Optional[str]]:
         """Verifies that a running process strictly matches recorded desk-audio-bridge GStreamer child.
 
-        Ensures:
-        1. Process exists and is alive (not zombie).
-        2. create_time matches within 1.0s to avoid PID reuse mistakes.
-        3. Process executable name is 'gst-launch-1.0'.
-        4. Command line contains the expected port and role-specific tokens.
+        Returns (is_verified, reason_if_not)
         """
         try:
             import psutil
             if not psutil.pid_exists(pid):
-                return False
+                return False, "Process does not exist"
             proc = psutil.Process(pid)
             if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-                return False
+                return False, "Process is not running or is zombie"
 
             recorded_time = child_info.get("create_time")
             if recorded_time is not None:
                 if abs(proc.create_time() - recorded_time) > 1.0:
-                    logger.warning(
-                        "PID %d create_time mismatch (expected %s, got %s); PID was reused",
-                        pid,
-                        recorded_time,
-                        proc.create_time(),
-                    )
-                    return False
+                    return False, f"create_time mismatch (expected {recorded_time}, got {proc.create_time()})"
 
             actual_cmd = proc.cmdline()
             if not actual_cmd:
-                return False
+                return False, "Process cmdline is empty"
 
             exe_name = os.path.basename(actual_cmd[0])
             if exe_name != "gst-launch-1.0":
-                logger.warning("PID %d is %s, not gst-launch-1.0", pid, exe_name)
-                return False
+                return False, f"Executable is {exe_name}, expected gst-launch-1.0"
 
             role = child_info.get("role")
             port = child_info.get("port")
             cmd_str = " ".join(actual_cmd)
 
             if port is not None and str(port) not in cmd_str:
-                logger.warning("PID %d cmdline missing expected port %d", pid, port)
-                return False
+                return False, f"Missing expected port {port} in cmdline"
 
             if role == "speaker":
                 if "udpsrc" not in cmd_str:
-                    logger.warning("PID %d cmdline missing expected speaker pipeline tokens", pid)
-                    return False
+                    return False, "Missing expected speaker pipeline token udpsrc"
             elif role == "microphone":
                 if "osxaudiosrc" not in cmd_str:
-                    logger.warning("PID %d cmdline missing expected microphone pipeline tokens", pid)
-                    return False
+                    return False, "Missing expected microphone pipeline token osxaudiosrc"
 
-
-            return True
+            return True, None
         except Exception as exc:
-            logger.debug("Verification error for PID %d: %s", pid, exc)
-            return False
+            return False, f"Verification error: {exc}"
 
-    def _terminate_stale_child(self, pid: int) -> None:
+    def _terminate_stale_child(self, pid: int, child_info: dict) -> bool:
+        """Terminates stale verified child and confirms death.
+        
+        Returns True ONLY if process is confirmed completely dead.
+        """
         try:
             import psutil
             if not psutil.pid_exists(pid):
-                return
+                return True
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGTERM)
         except Exception:
@@ -397,12 +410,10 @@ class MacBridgeController:
         while time.time() - start_t < 2.0:
             try:
                 import psutil
-                if not psutil.pid_exists(pid):
-                    break
-                if not psutil.Process(pid).is_running():
-                    break
+                if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
+                    return True
             except Exception:
-                break
+                return True
             time.sleep(0.05)
 
         try:
@@ -416,15 +427,43 @@ class MacBridgeController:
                         os.kill(pid, signal.SIGKILL)
                     except Exception:
                         pass
-                time.sleep(0.1)
+                start_kill_t = time.time()
+                while time.time() - start_kill_t < 1.0:
+                    if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
+                        return True
+                    time.sleep(0.05)
         except Exception:
-            pass
+            return True
 
-    def _recover_stale_owned_children(self) -> None:
-        """Recovers and terminates verified orphaned child processes left by previous abnormal controller death."""
-        journal = self._load_ownership_journal()
+        # Final death check
+        try:
+            import psutil
+            if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
+                return True
+            # Also check create_time in case of instantaneous PID reuse
+            proc = psutil.Process(pid)
+            exp_time = child_info.get("create_time")
+            if exp_time is not None and abs(proc.create_time() - exp_time) > 1.0:
+                return True
+            return False
+        except Exception:
+            return True
+
+    def _recover_stale_owned_children(self) -> Tuple[bool, Optional[str]]:
+        """Recovers and terminates verified orphaned child processes left by previous abnormal controller death.
+        
+        Returns:
+            (True, None) if recovery completed cleanly (or no journal present).
+            (False, error_str) if recovery failed closed due to corrupt journal, unverified live PID, or termination failure.
+        """
+        journal, err = self._load_ownership_journal()
+        if err:
+            err_msg = f"Recovery failed-closed: {err}"
+            logger.error(err_msg)
+            return False, err_msg
+
         if not journal:
-            return
+            return True, None
 
         prior_owner_pid = journal.get("owner_pid")
         prior_owner_time = journal.get("owner_create_time")
@@ -432,7 +471,7 @@ class MacBridgeController:
 
         # If recorded owner is still the current process, nothing to recover
         if prior_owner_pid == current_pid:
-            return
+            return True, None
 
         # Verify prior owner is no longer the same live process
         if prior_owner_pid and isinstance(prior_owner_pid, int):
@@ -442,35 +481,81 @@ class MacBridgeController:
                     p_owner = psutil.Process(prior_owner_pid)
                     if p_owner.is_running() and p_owner.status() != psutil.STATUS_ZOMBIE:
                         if prior_owner_time is None or abs(p_owner.create_time() - prior_owner_time) <= 1.0:
-                            logger.warning(
-                                "Prior controller owner PID %d is still alive; skipping recovery",
-                                prior_owner_pid,
-                            )
-                            return
+                            err_msg = f"Prior controller owner PID {prior_owner_pid} is still alive; cannot recover"
+                            logger.warning(err_msg)
+                            return False, err_msg
             except Exception:
                 pass
 
         children = journal.get("children", {})
+        retained_children = {}
+        recovery_failed = False
+        first_failure_reason = None
+
         for role, child_info in list(children.items()):
-            c_pid = child_info.get("pid")
-            if not c_pid or not isinstance(c_pid, int):
+            if not isinstance(child_info, dict):
+                retained_children[role] = child_info
+                recovery_failed = True
+                first_failure_reason = f"Malformed child info for role {role}"
                 continue
 
-            if self._verify_child_identity(c_pid, child_info):
-                logger.info(
-                    "Recovering verified orphaned %s child [PID %d] from crashed controller",
-                    role,
-                    c_pid,
-                )
-                self._terminate_stale_child(c_pid)
-            else:
-                logger.warning(
-                    "Stale child [PID %d] role %s failed ownership verification; leaving untouched",
-                    c_pid,
-                    role,
-                )
+            c_pid = child_info.get("pid")
+            if not c_pid or not isinstance(c_pid, int):
+                retained_children[role] = child_info
+                recovery_failed = True
+                first_failure_reason = f"Invalid PID in child info for role {role}"
+                continue
 
+            import psutil
+            if not psutil.pid_exists(c_pid):
+                # Process no longer exists: safely resolved
+                logger.debug("Recorded child [PID %d] no longer exists; safely resolved", c_pid)
+                continue
+
+            # PID exists: check if create_time mismatch proves PID reuse
+            try:
+                p_child = psutil.Process(c_pid)
+                rec_time = child_info.get("create_time")
+                if rec_time is not None and abs(p_child.create_time() - rec_time) > 1.0:
+                    # Original process is dead; PID has been reused by unrelated process
+                    logger.info("Recorded child [PID %d] create_time mismatch; process is gone (PID reused); safely resolved", c_pid)
+                    continue
+            except Exception:
+                # Process disappeared
+                continue
+
+            # Process still exists with same or unconfirmed identity: verify ownership
+            verified, reason = self._verify_child_identity(c_pid, child_info)
+            if verified:
+                logger.info("Recovering verified orphaned %s child [PID %d] from crashed controller", role, c_pid)
+                death_confirmed = self._terminate_stale_child(c_pid, child_info)
+                if death_confirmed:
+                    logger.info("Confirmed death of orphaned %s child [PID %d]", role, c_pid)
+                else:
+                    err_msg = f"Failed to terminate orphaned {role} child [PID {c_pid}]; still alive"
+                    logger.error(err_msg)
+                    retained_children[role] = child_info
+                    recovery_failed = True
+                    if not first_failure_reason:
+                        first_failure_reason = err_msg
+            else:
+                err_msg = f"Child [PID {c_pid}] role {role} exists but failed identity verification ({reason}); retaining record"
+                logger.warning(err_msg)
+                retained_children[role] = child_info
+                recovery_failed = True
+                if not first_failure_reason:
+                    first_failure_reason = err_msg
+
+        if retained_children:
+            # Update journal with remaining unresolved entries
+            journal["children"] = retained_children
+            self._write_ownership_journal(journal)
+            return False, first_failure_reason
+
+        # All entries safely resolved: clear journal
         self._clear_ownership_journal()
+        return True, None
+
 
     def _load_persisted_desired_state(self) -> DesiredState:
         if os.path.exists(self.state_file):
@@ -515,7 +600,12 @@ class MacBridgeController:
                     return False
 
             # Recover any stale orphaned children left by previous crashed owner
-            self._recover_stale_owned_children()
+            rec_ok, rec_err = self._recover_stale_owned_children()
+            if not rec_ok:
+                self._last_actionable_error = rec_err or "Stale child recovery failed-closed"
+                self._controller_state = LifecycleState.ERROR
+                logger.error("Controller host start rejected: %s", self._last_actionable_error)
+                return False
 
             # Reload persisted desired state to ensure consistency
             self._desired_state = self._load_persisted_desired_state()
@@ -561,7 +651,13 @@ class MacBridgeController:
                     return False
 
             # Recover any stale orphaned children left by previous crashed owner
-            self._recover_stale_owned_children()
+            rec_ok, rec_err = self._recover_stale_owned_children()
+            if not rec_ok:
+                self._last_actionable_error = rec_err or "Stale child recovery failed-closed"
+                self._controller_state = LifecycleState.ERROR
+                logger.error("Controller start rejected: %s", self._last_actionable_error)
+                return False
+
 
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
@@ -845,7 +941,17 @@ class MacBridgeController:
         try:
             pid = self.process_runner.start_process(cmd)
             self._speaker_child_pid = pid
-            self._record_child_started("speaker", pid, cmd, DEFAULT_SPEAKER_RTP_PORT)
+            journal_ok = self._record_child_started("speaker", pid, cmd, DEFAULT_SPEAKER_RTP_PORT)
+            if not journal_ok:
+                err_msg = "Failed to atomically record speaker child in ownership journal; failing closed"
+                logger.error(err_msg)
+                self.process_runner.stop_process(pid)
+                self._speaker_child_pid = None
+                self._speaker_path_state = PathState.FAILED
+                self._controller_state = LifecycleState.ERROR
+                self._last_actionable_error = err_msg
+                return
+
             self._active_peer_address = self.discovery_service.peer_address
             self._active_local_bind = local_bind
             self._speaker_path_state = PathState.RUNNING
@@ -857,6 +963,7 @@ class MacBridgeController:
             self._active_local_bind = None
             self._speaker_path_state = PathState.FAILED
             self._controller_state = LifecycleState.ERROR
+
 
     def _reconcile_microphone(self) -> None:
         """Idempotently reconciles the macOS microphone sender path."""
@@ -925,7 +1032,16 @@ class MacBridgeController:
         try:
             pid = self.process_runner.start_process(cmd)
             self._microphone_child_pid = pid
-            self._record_child_started("microphone", pid, cmd, DEFAULT_MIC_RTP_PORT)
+            journal_ok = self._record_child_started("microphone", pid, cmd, DEFAULT_MIC_RTP_PORT)
+            if not journal_ok:
+                err_msg = "Failed to atomically record microphone child in ownership journal; failing closed"
+                logger.error(err_msg)
+                self.process_runner.stop_process(pid)
+                self._microphone_child_pid = None
+                self._microphone_path_state = PathState.FAILED
+                self._last_actionable_microphone_error = err_msg
+                return
+
             self._microphone_path_state = PathState.RUNNING
             self._last_actionable_microphone_error = None
         except Exception as exc:
@@ -933,6 +1049,7 @@ class MacBridgeController:
                 f"Failed to start microphone sender: {exc}"
             )
             self._microphone_path_state = PathState.FAILED
+
 
 
     def _on_peer_discovered(self, peer_ip: str, local_ip: str, peer_port: int, peer_inst: str) -> None:
