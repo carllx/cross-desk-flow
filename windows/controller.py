@@ -154,6 +154,10 @@ class LocalControlServer:
                 elif cmd == "mic-disable":
                     success = self.controller.set_microphone_enabled(False)
                     res = {"success": success, "microphone_path_state": self.controller.get_status().microphone_path_state}
+                elif cmd == "shutdown":
+                    # Clean host shutdown: do not change desired state
+                    self.controller.shutdown_host()
+                    res = {"success": True}
                 else:
                     res = {"error": f"Unknown command {cmd}"}
 
@@ -319,12 +323,77 @@ class WindowsBridgeController:
             self._controller_state = LifecycleState.STOPPED
             return True
 
-    def shutdown(self) -> None:
-        """Full shutdown of controller, releasing singleton lock and IPC server."""
-        self.stop()
+    def start_host(self) -> bool:
+        """Starts controller host runtime according to persisted desired state without mutating it.
+        
+        - Checks preflight dependencies.
+        - Acquires singleton lock.
+        - Starts local IPC server.
+        - Loads persisted desired state.
+        - If ENABLED: starts discovery and reconciles pipelines.
+        - If STOPPED_BY_USER: leaves controller in STOPPED state with zero media children.
+        """
         with self._lock:
+            ok, err_msg = check_runtime_dependencies()
+            if not ok:
+                self._last_actionable_error = err_msg
+                self._controller_state = LifecycleState.ERROR
+                logger.error("Preflight failure: %s", err_msg)
+                return False
+
+            if not self._singleton_lock.is_held:
+                if not self._singleton_lock.acquire():
+                    logger.warning("Controller start rejected: another process holds the singleton lock")
+                    return False
+
+            self._desired_state = self._load_persisted_desired_state()
+            self._ipc_server.start()
+
+            if self._desired_state == DesiredState.ENABLED:
+                self._controller_state = LifecycleState.STARTING
+                self._speaker_path_state = PathState.IDLE
+                self._last_actionable_error = None
+                try:
+                    self.discovery_service.start()
+                except Exception as exc:
+                    self._last_actionable_error = f"Discovery start failed: {exc}"
+                    self._controller_state = LifecycleState.ERROR
+                self.reconcile()
+            else:
+                self._controller_state = LifecycleState.STOPPED
+                self._speaker_path_state = PathState.STOPPED
+                self._microphone_path_state = PathState.STOPPED
+
+            return True
+
+    def shutdown_host(self) -> None:
+        """Shuts down host runtime, stopping owned children, IPC, and singleton WITHOUT mutating desired state."""
+        with self._lock:
+            # Stop owned speaker pipeline child
+            if self._speaker_child_pid is not None:
+                self.process_runner.stop_process(self._speaker_child_pid)
+                self._speaker_child_pid = None
+            self._active_peer_address = None
+            self._active_local_bind = None
+            self._speaker_path_state = PathState.STOPPED
+
+            # Stop owned microphone pipeline child
+            if self._microphone_child_pid is not None:
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+            self._microphone_path_state = PathState.STOPPED
+
+            # Stop discovery
+            self.discovery_service.stop()
+
+            # Stop IPC server and release lock
             self._ipc_server.stop()
             self._singleton_lock.release()
+            self._controller_state = LifecycleState.STOPPED
+
+    def shutdown(self) -> None:
+        """Full shutdown of controller host. Deprecated alias for shutdown_host."""
+        self.shutdown_host()
 
     def get_status(self) -> ControllerStatus:
         """Pure read-only query of controller status without side-effects."""

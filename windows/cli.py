@@ -63,7 +63,7 @@ def run_host_service():
     Fails closed with exit code 2 if another process holds the singleton lock.
     """
     controller = WindowsBridgeController()
-    if not controller.start():
+    if not controller.start_host():
         print("Failed to start controller host: singleton lock held by another process", file=sys.stderr)
         sys.exit(2)
 
@@ -75,15 +75,22 @@ def run_host_service():
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        controller.shutdown()
+        controller.shutdown_host()
         print("Controller host shutdown cleanly")
 
 
 def main():
+    from .task_scheduler import (
+        install_scheduled_task,
+        is_scheduled_task_installed,
+        reinstall_scheduled_task,
+        uninstall_scheduled_task,
+    )
+
     parser = argparse.ArgumentParser(description="desk-audio-bridge Windows controller")
     parser.add_argument(
         "command",
-        choices=["start", "stop", "status", "reconcile", "run"],
+        choices=["start", "stop", "status", "reconcile", "run", "install", "reinstall", "uninstall"],
         help="Action to execute",
     )
     parser.add_argument("--json", action="store_true", help="Output status in JSON format")
@@ -92,6 +99,33 @@ def main():
 
     if args.command == "run":
         run_host_service()
+        return
+
+    if args.command == "install":
+        ok, msg = install_scheduled_task()
+        if ok:
+            print(f"Install successful: {msg}")
+        else:
+            print(f"Install failed: {msg}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "reinstall":
+        ok, msg = reinstall_scheduled_task()
+        if ok:
+            print(f"Reinstall successful: {msg}")
+        else:
+            print(f"Reinstall failed: {msg}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "uninstall":
+        ok, msg = uninstall_scheduled_task()
+        if ok:
+            print(f"Uninstall successful: {msg}")
+        else:
+            print(f"Uninstall failed: {msg}", file=sys.stderr)
+            sys.exit(1)
         return
 
     # For Start: Ensure controller host is running, then send start command
@@ -146,6 +180,8 @@ def main():
             print(f"Speaker Path State:    {status_dict.get('speaker_path_state')}")
             print(f"Speaker Port:          {status_dict.get('speaker_target_port')}")
             print(f"Owned Children Count:  {status_dict.get('owned_children_count')}")
+            task_installed = is_scheduled_task_installed()
+            print(f"Scheduled Task:        {'Installed' if task_installed else 'Not Installed'}")
             if status_dict.get("last_actionable_error"):
                 print(f"Last Error:            {status_dict.get('last_actionable_error')}")
 
