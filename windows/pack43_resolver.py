@@ -16,7 +16,6 @@ import logging
 import os
 import shutil
 import subprocess
-import time
 from typing import NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
@@ -26,7 +25,6 @@ PACK43_EXPECTED_DRIVER_VERSION = "1.0.3.5"
 PACK43_EXPECTED_MANUFACTURER = "VB-Audio Software"
 PACK43_RENDER_NAME_SUBSTRING = "CABLE Input"
 PACK43_CAPTURE_NAME_SUBSTRING = "CABLE Output"
-DEFAULT_NEGATIVE_CACHE_TTL_SEC = 10.0
 
 
 class Pack43ResolutionResult(NamedTuple):
@@ -38,16 +36,10 @@ class Pack43ResolutionResult(NamedTuple):
 class Pack43Resolver:
     """Production resolver and identity verifier for VB-CABLE Pack43 on Windows."""
 
-    def __init__(
-        self,
-        pwsh_path: Optional[str] = None,
-        negative_cache_ttl_sec: float = DEFAULT_NEGATIVE_CACHE_TTL_SEC,
-    ):
+    def __init__(self, pwsh_path: Optional[str] = None):
         self._pwsh_path = pwsh_path
-        self._negative_cache_ttl_sec = negative_cache_ttl_sec
         self._cached_result: Optional[Pack43ResolutionResult] = None
         self._has_cached: bool = False
-        self._last_negative_time: Optional[float] = None
 
     def _get_powershell_executable(self) -> Optional[str]:
         if self._pwsh_path and os.path.exists(self._pwsh_path):
@@ -65,16 +57,11 @@ class Pack43Resolver:
         """Explicitly marks cached resolution as stale, forcing re-enumeration on next request."""
         self._has_cached = False
         self._cached_result = None
-        self._last_negative_time = None
 
     @property
     def has_probed(self) -> bool:
         """Read-only check if Pack43 has been probed at least once since start or last invalidation."""
-        if self._cached_result is not None:
-            return True
-        if self._has_cached and self._last_negative_time is not None:
-            return time.monotonic() - self._last_negative_time < self._negative_cache_ttl_sec
-        return False
+        return self._has_cached
 
     @property
     def is_cached_available(self) -> Optional[bool]:
@@ -82,47 +69,33 @@ class Pack43Resolver:
 
         Returns:
           True  -> Probed and confirmed available.
-          False -> Probed and confirmed unavailable / mismatched (within negative cache TTL).
-          None  -> Not probed yet, or negative cache has expired.
+          False -> Probed and confirmed unavailable / mismatched.
+          None  -> Not probed yet (fresh / unprobed state).
         """
-        if self._cached_result is not None:
-            return True
-        if self._has_cached and self._cached_result is None:
-            if self._last_negative_time is not None:
-                if time.monotonic() - self._last_negative_time < self._negative_cache_ttl_sec:
-                    return False
-                return None
-            return False
-        return None
+        if not self._has_cached:
+            return None
+        return self._cached_result is not None
 
     def resolve_pack43(self, force_refresh: bool = False) -> Optional[Pack43ResolutionResult]:
         """Resolves Pack43 render endpoint and validates driver identity.
 
-        - Positive results are cached indefinitely (until explicitly invalidated or pipeline error).
-        - Negative results are cached with a bounded cooldown (negative_cache_ttl_sec)
-          to avoid WMI hammering while allowing safe periodic background retry.
-        - force_refresh=True forces an immediate re-enumeration regardless of cache state.
+        - Positive results remain cached.
+        - Negative results remain cached and fail-closed; ordinary periodic reconcile()
+          will NOT repeatedly re-enumerate WMI.
+        - force_refresh=True or invalidate_cache() forces an immediate re-enumeration.
         - Returns Pack43ResolutionResult if found and valid; returns None (fail-closed) otherwise.
         """
-        if not force_refresh:
-            if self._cached_result is not None:
-                return self._cached_result
-            if self._has_cached and self._cached_result is None:
-                if self._last_negative_time is not None:
-                    if time.monotonic() - self._last_negative_time < self._negative_cache_ttl_sec:
-                        return None
-                    # Negative cache cooldown has expired; proceed to retry enumeration
+        if not force_refresh and self._has_cached:
+            return self._cached_result
 
         result = self._query_pack43()
         if result is not None:
             self._cached_result = result
             self._has_cached = True
-            self._last_negative_time = None
             return result
         else:
             self._cached_result = None
             self._has_cached = True
-            self._last_negative_time = time.monotonic()
             return None
 
     def _query_pack43(self) -> Optional[Pack43ResolutionResult]:

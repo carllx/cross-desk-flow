@@ -62,9 +62,8 @@ class FakePack43Resolver(Pack43Resolver):
         self,
         should_succeed: bool = True,
         render_id: str = "{0.0.0.00000000}.{MOCK_PACK43_INPUT}",
-        negative_cache_ttl_sec: float = 10.0,
     ):
-        super().__init__(negative_cache_ttl_sec=negative_cache_ttl_sec)
+        super().__init__()
         self.should_succeed = should_succeed
         self.render_id = render_id
         self.resolve_call_count = 0
@@ -504,52 +503,12 @@ def test_speaker_endpoint_failure_does_not_prevent_requested_microphone_path(tem
     ctrl.shutdown()
 
 
-def test_pack43_negative_cache_expiration_and_background_retry():
-    """Verifies that negative Pack43 resolution result expires after TTL and retries safely."""
-    # Use short negative cache TTL for test
-    resolver = FakePack43Resolver(should_succeed=False, negative_cache_ttl_sec=0.05)
-    assert resolver.is_cached_available is None
+def test_mic_enable_negative_cache_and_reconcile_isolation(temp_state_file):
+    """Verifies that transient Pack43 failure caches UNAVAILABLE, ordinary repeated reconcile()
 
-    # First resolve: fails and records negative result in cache
-    res1 = resolver.resolve_pack43()
-    assert res1 is None
-    assert resolver.resolve_call_count == 1
-    assert resolver.underlying_enumeration_count == 1
-    assert resolver.is_cached_available is False
-
-    # Second resolve (immediate, within TTL): hits negative cache, does NOT re-enumerate
-    res2 = resolver.resolve_pack43()
-    assert res2 is None
-    assert resolver.resolve_call_count == 2
-    assert resolver.underlying_enumeration_count == 1
-    assert resolver.is_cached_available is False
-
-    # Wait for negative cache TTL to expire
-    time.sleep(0.06)
-
-    # Now negative cache is expired: is_cached_available becomes None (pending re-probe)
-    assert resolver.is_cached_available is None
-
-    # Simulate driver becoming available after transient failure
-    resolver.should_succeed = True
-
-    # Next resolve triggers underlying enumeration and succeeds
-    res3 = resolver.resolve_pack43()
-    assert res3 is not None
-    assert resolver.resolve_call_count == 3
-    assert resolver.underlying_enumeration_count == 2
-    assert resolver.is_cached_available is True
-
-    # Subsequent call hits positive cache without re-enumerating
-    res4 = resolver.resolve_pack43()
-    assert res4 == res3
-    assert resolver.resolve_call_count == 4
-    assert resolver.underlying_enumeration_count == 2
-    assert resolver.is_cached_available is True
-
-
-def test_mic_enable_invalidates_negative_cache_recovering_from_transient_failure(temp_state_file):
-    """Explicit mic-enable invalidates negative cache, allowing recovery from transient WMI failure."""
+    does NOT trigger any new WMI enumeration, and second explicit mic-enable invalidates
+    negative cache and recovers to RUNNING.
+    """
     runner = FakeProcessRunner()
     pack43 = FakePack43Resolver(should_succeed=False)
     disc = FakeDiscoveryService()
@@ -559,33 +518,81 @@ def test_mic_enable_invalidates_negative_cache_recovering_from_transient_failure
         device_resolver=FakeDeviceResolver(),
         discovery_service=disc,
         pack43_resolver=pack43,
-        lock_port=50181,
-        ipc_port=50182,
+        lock_port=50185,
+        ipc_port=50186,
     )
 
     ctrl.start()
     assert ctrl.get_status().speaker_path_state == PathState.RUNNING.value
 
-    # First mic-enable fails due to transient failure and records negative cache
+    # 1. Initial mic-enable -> transient Pack43 failure -> UNAVAILABLE / fail-closed
     success1 = ctrl.set_microphone_enabled(True)
     assert success1 is False
     status1 = ctrl.get_status()
     assert status1.microphone_path_state == PathState.UNAVAILABLE.value
     assert status1.pack43_available is False
     assert pack43.underlying_enumeration_count == 1
+    assert len(runner.started_commands) == 1  # Only speaker running; no mic fallback
 
-    # Transient failure resolves (e.g. WMI is now responsive / driver initialized)
+    # Transient condition clears (e.g. driver initialized / WMI responsive)
     pack43.should_succeed = True
 
-    # Second explicit mic-enable MUST invalidate negative cache and succeed
+    # 2. Ordinary repeated reconcile() -> NO new WMI enumeration (hot path protected)
+    for _ in range(5):
+        ctrl.reconcile()
+    assert pack43.underlying_enumeration_count == 1, "Ordinary reconcile must not trigger WMI enumeration"
+    assert ctrl.get_status().microphone_path_state == PathState.UNAVAILABLE.value
+
+    # 3. Second explicit mic-enable -> invalidates negative cache -> fresh enumeration -> RUNNING
     success2 = ctrl.set_microphone_enabled(True)
     assert success2 is True
+    assert pack43.underlying_enumeration_count == 2, "Explicit mic-enable must perform fresh enumeration"
     status2 = ctrl.get_status()
     assert status2.microphone_path_state == PathState.RUNNING.value
     assert status2.pack43_available is True
-    assert pack43.underlying_enumeration_count == 2
     assert len(runner.started_commands) == 2
     ctrl.shutdown()
+
+
+def test_ipc_command_timeout_bounds():
+    """Verifies that lifecycle bounded probes retain short 2.0s timeout and mic-enable uses explicit long timeout."""
+    import windows.cli as cli
+    from unittest.mock import MagicMock, patch
+
+    # 1. Verify constant values
+    assert cli.DEFAULT_IPC_TIMEOUT_SEC == 2.0
+    assert cli.MIC_ENABLE_IPC_TIMEOUT_SEC == 15.0
+
+    # 2. Proves default send_ipc_command calls (e.g. status, stop, start, reconcile) use 2.0s
+    with patch("socket.socket") as mock_sock_cls:
+        mock_sock = MagicMock()
+        mock_sock_cls.return_value = mock_sock
+        mock_sock.recv.return_value = b'{"status": "ok"}'
+
+        cli.send_ipc_command("status")
+        mock_sock.settimeout.assert_called_with(2.0)
+
+        cli.send_ipc_command("stop")
+        mock_sock.settimeout.assert_called_with(2.0)
+
+        cli.send_ipc_command("reconcile")
+        mock_sock.settimeout.assert_called_with(2.0)
+
+        # 3. Explicit mic-enable call passes 15.0s
+        cli.send_ipc_command("mic-enable", timeout=cli.MIC_ENABLE_IPC_TIMEOUT_SEC)
+        mock_sock.settimeout.assert_called_with(15.0)
+
+    # 4. CLI dispatch for mic-enable invokes with 15.0s timeout
+    with patch("windows.cli.send_ipc_command", return_value={"success": True}) as mock_send:
+        with patch("sys.argv", ["cli", "mic-enable"]):
+            cli.main()
+            mock_send.assert_called_once_with("mic-enable", timeout=15.0)
+
+    # 5. CLI dispatch for status uses default 2.0s timeout (not 15.0s)
+    with patch("windows.cli.send_ipc_command", return_value={"controller_state": "ACTIVE"}) as mock_send:
+        with patch("sys.argv", ["cli", "status"]):
+            cli.main()
+            mock_send.assert_called_once_with("status")
 
 
 def test_mic_enable_fails_closed_when_pack43_permanently_unavailable(temp_state_file):

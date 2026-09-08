@@ -18,10 +18,14 @@ from bridge_core.contract import (
 from .controller import WindowsBridgeController
 
 
+DEFAULT_IPC_TIMEOUT_SEC = 2.0
+MIC_ENABLE_IPC_TIMEOUT_SEC = 15.0
+
+
 def send_ipc_command(
     command: str,
     port: int = DEFAULT_LOCAL_IPC_PORT,
-    timeout: float = 15.0,
+    timeout: float = DEFAULT_IPC_TIMEOUT_SEC,
 ) -> Optional[Dict[str, Any]]:
     """Sends command to running controller owner via local loopback TCP socket."""
     try:
@@ -101,7 +105,7 @@ def main():
         return
 
     if args.command == "mic-enable":
-        res = send_ipc_command("mic-enable")
+        res = send_ipc_command("mic-enable", timeout=MIC_ENABLE_IPC_TIMEOUT_SEC)
         if res and res.get("success"):
             print("Microphone enabled (RUNNING)")
         else:
