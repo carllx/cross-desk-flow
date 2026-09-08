@@ -41,8 +41,9 @@ from .speaker_receiver import SpeakerReceiverBuilder
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STATE_FILE = os.path.expanduser(
-    "~/Library/Application Support/desk-audio-bridge/controller_state.json"
+DEFAULT_STATE_FILE = os.environ.get(
+    "DESK_AUDIO_BRIDGE_STATE_FILE",
+    os.path.expanduser("~/Library/Application Support/desk-audio-bridge/controller_state.json"),
 )
 
 
