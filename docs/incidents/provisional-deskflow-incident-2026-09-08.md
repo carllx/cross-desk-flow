@@ -67,16 +67,15 @@
    * Windows 端确认已开启剪贴板历史记录（`HKCU:\Software\Microsoft\Clipboard\EnableClipboardHistory = 1`）。
 2. **受控单次传递 (Single Copy Test)**：
    * macOS 端临时开启剪贴板共享，并在 Mac 端确认执行了一次唯一的纯文本 Token 复制（时间戳 `09:29:56.705`）：`CLIP_TEST_20260908_A`（未主动进行二次复制，无富文本/图像）。
-   * **用户 UI 观测 (Single Token Delivery)**：
-     * Delivered: **YES**
-     * Windows 端呼出 `Win + V` 剪贴板历史，目标 Token **精确仅出现 1 次**。
-     * 粘贴至普通 Notepad 验证内容完整准确。
-   * **日志与网络传输观测 (Update Attribution Discipline)**：
-     * Windows 端在剪贴板共享启用与配置重载测试窗口期间（`09:28:27–09:28:35`）记录到一次 13-entry 的 `INFO: clipboard was updated` 爆发更新（含同毫秒 3 连发特征）。
-     * **严格证据归因**：由于该 13 次更新的时间戳（`09:28:27–09:28:35`）先于 macOS 实际触发唯一 Token 复制的时间戳（`09:29:56.705`），**两者时间未对齐，严禁将该 13-entry burst 归因于本次单次复制**。不得将其记录为“Verified single-copy feedback loop”。
-     * macOS Server 确实观测到了来自 Windows 的网络回弹，但已将其标记为 `mis-sequenced` 并成功予以忽略（ignored）。
-   * **性能与稳定性**：测试期间 `deskflow-core.exe` CPU 持续维持 0.00%，内存稳定在约 14.61 MB，系统 UI 无卡顿，无 deadlock，无 `0xc0000409` 崩溃。
-   * **测试后处置**：验证完毕后两端已立即恢复为 **Clipboard Sharing = OFF**。
+    * **用户 UI 观测 (Single Token Delivery)**：
+      * Delivered: **YES**
+      * Windows 端呼出 `Win + V` 剪贴板历史，目标 Token **精确仅出现 1 次**。
+    * **日志与网络传输观测 (Update Attribution Discipline)**：
+      * Windows 端在剪贴板共享启用与配置重载测试窗口期间（`09:28:27–09:28:35`）记录到一次 13-entry 的 `INFO: clipboard was updated` 爆发更新（含同毫秒 3 连发特征）。
+      * **严格证据归因**：由于该 13 次更新的时间戳（`09:28:27–09:28:35`）先于 macOS 实际触发唯一 Token 复制的时间戳（`09:29:56.705`），**两者时间未对齐，严禁将该 13-entry burst 归因于本次单次复制**。不得将其记录为“Verified single-copy feedback loop”。
+      * macOS Server 确实观测到了来自 Windows 的网络回弹，但已将其标记为 `mis-sequenced` 并成功予以忽略（ignored）。
+    * **性能与稳定性**：测试期间 `deskflow-core.exe` CPU 持续维持 0.00%，内存稳定在约 14.61 MB，系统 UI 无卡顿，无 deadlock，无 `0xc0000409` 崩溃。
+    * **测试后处置**：验证完毕后两端已立即恢复为 **Clipboard Sharing = OFF**。
 
 ---
 
@@ -86,7 +85,7 @@
 
 * **Verified Root Cause**: `Windows Deskflow Service / privileged daemon path was not active.`
 * **技术机理**：
-  Windows 的用户界面特权隔离（UIPI）与会话桌面隔离机制禁止非提权的普通用户应用向高特权窗口或 Winlogon 安全桌面（Secure Desktop）注入鼠标和键盘输入。当 Windows 的 `Deskflow` 服务处于 Stopped 状态时，系统退回桌面模式（Desktop Mode），由普通用户权限的 GUI 直接运行 core 进程，因不具备跨 Session 及 LocalSystem/UIAccess 特权，必然在 Secure Desktop 下丧失输入能力。只有当 Session 0 服务激活并派生出高特权 watchdog core 进程接入用户会话时，跨屏控制才能接管提权对话框。
+  在本次故障现场，Service 停止与 privileged daemon/core path 缺失同时出现，并伴随 UAC / elevated-window 输入失效；恢复 Service Mode、建立 daemon-owned SYSTEM core 后，相同 Human Gate 恢复正常。Windows 的用户界面特权隔离（UIPI）与会话桌面隔离机制禁止非提权的普通用户应用向高特权窗口或 Winlogon 安全桌面（Secure Desktop）注入鼠标和键盘输入。当 Windows 的 `Deskflow` 服务处于 Stopped 状态时，系统退回桌面模式（Desktop Mode），由普通用户权限的 GUI 直接运行 core 进程，因不具备跨 Session 及 LocalSystem/UIAccess 特权，在该故障现场环境下丧失了对提权界面的控制能力。
 
 ### 剪贴板风暴历史故障
 
