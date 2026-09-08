@@ -18,11 +18,15 @@ from bridge_core.contract import (
 from .controller import WindowsBridgeController
 
 
-def send_ipc_command(command: str, port: int = DEFAULT_LOCAL_IPC_PORT) -> Optional[Dict[str, Any]]:
+def send_ipc_command(
+    command: str,
+    port: int = DEFAULT_LOCAL_IPC_PORT,
+    timeout: float = 15.0,
+) -> Optional[Dict[str, Any]]:
     """Sends command to running controller owner via local loopback TCP socket."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.0)
+        s.settimeout(timeout)
         s.connect(("127.0.0.1", port))
         req = json.dumps({"command": command})
         s.sendall(req.encode("utf-8"))
@@ -85,7 +89,7 @@ def main():
     parser = argparse.ArgumentParser(description="desk-audio-bridge Windows controller")
     parser.add_argument(
         "command",
-        choices=["start", "stop", "status", "reconcile", "run", "install", "reinstall", "uninstall"],
+        choices=["start", "stop", "status", "reconcile", "run", "install", "reinstall", "uninstall", "mic-enable", "mic-disable"],
         help="Action to execute",
     )
     parser.add_argument("--json", action="store_true", help="Output status in JSON format")
@@ -94,6 +98,25 @@ def main():
 
     if args.command == "run":
         run_host_service()
+        return
+
+    if args.command == "mic-enable":
+        res = send_ipc_command("mic-enable")
+        if res and res.get("success"):
+            print("Microphone enabled (RUNNING)")
+        else:
+            state = res.get("microphone_path_state") if res else "UNKNOWN"
+            print(f"Failed to enable microphone (state: {state})", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "mic-disable":
+        res = send_ipc_command("mic-disable")
+        if res and res.get("success"):
+            print("Microphone disabled (STOPPED)")
+        else:
+            print("Failed to disable microphone", file=sys.stderr)
+            sys.exit(1)
         return
 
     if args.command == "install":

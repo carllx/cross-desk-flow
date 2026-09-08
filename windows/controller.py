@@ -294,6 +294,12 @@ class WindowsBridgeController:
                 self._last_actionable_microphone_error = None
                 return True
 
+            # When enabling microphone, if Pack43 is not already confirmed available,
+            # invalidate any negative or stale cache so that a transient previous failure
+            # does not block fresh re-probing on explicit user request.
+            if self.pack43_resolver.is_cached_available is not True:
+                self.pack43_resolver.invalidate_cache()
+
             # When enabling microphone, run reconcile
             self.reconcile()
             return self._microphone_path_state == PathState.RUNNING
