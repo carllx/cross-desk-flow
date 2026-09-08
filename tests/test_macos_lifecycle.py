@@ -7,13 +7,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 import pytest
 
 from bridge_core.contract import DEFAULT_SPEAKER_RTP_PORT, DesiredState, LifecycleState, PathState
 from macos.controller import MacBridgeController, SingleInstanceLock
 from macos.lifecycle import (
     LAUNCH_AGENT_LABEL,
+    bootout_service,
     generate_launch_agent_plist,
+    handoff_existing_manual_controller,
     is_service_loaded,
     write_launch_agent_plist,
     install_launch_agent,
@@ -62,6 +65,7 @@ def test_plist_generation_structure():
     assert plist_dict["WorkingDirectory"] == "/dummy/repo"
     assert plist_dict["RunAtLoad"] is True
     assert plist_dict["KeepAlive"] is True
+    assert plist_dict["ThrottleInterval"] == 2
     assert "EnvironmentVariables" in plist_dict
     assert plist_dict["EnvironmentVariables"]["PYTHONUNBUFFERED"] == "1"
     assert plist_dict["EnvironmentVariables"]["PYTHONPATH"] == "/dummy/repo"
@@ -181,11 +185,89 @@ def test_idempotent_lifecycle_mock_registration(tmp_path):
         assert json.load(f)["desired_state"] == DesiredState.STOPPED_BY_USER.value
 
     # 3. Uninstall (removes plist and state)
-    ok = uninstall_launch_agent(plist_path=test_plist, remove_state=True, state_file=test_state)
+    ok, err = uninstall_launch_agent(plist_path=test_plist, remove_state=True, state_file=test_state)
     assert ok is True
+    assert err is None
     assert not os.path.exists(test_plist)
     assert not os.path.exists(test_state)
 
     # 4. Repeated uninstall succeeds safely
-    ok_repeated = uninstall_launch_agent(plist_path=test_plist, remove_state=True, state_file=test_state)
+    ok_repeated, err_repeated = uninstall_launch_agent(plist_path=test_plist, remove_state=True, state_file=test_state)
     assert ok_repeated is True
+    assert err_repeated is None
+
+
+def test_manual_controller_handoff_enabled(temp_state_path):
+    """Verifies that handoff_existing_manual_controller terminates a running manual controller while preserving ENABLED."""
+    with open(temp_state_path, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    # Launch manual controller in subprocess
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "macos.cli", "run"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1.0)
+    assert proc.poll() is None
+
+    # Handoff manual controller
+    ok, err = handoff_existing_manual_controller()
+    assert ok is True, f"Handoff failed: {err}"
+    assert proc.poll() is not None, "Manual controller process must be terminated"
+
+    # Verify state file still has ENABLED
+    with open(temp_state_path, "r", encoding="utf-8") as f:
+        assert json.load(f)["desired_state"] == DesiredState.ENABLED.value
+
+
+def test_manual_controller_handoff_stopped_by_user(temp_state_path):
+    """Verifies that handoff_existing_manual_controller terminates a running manual controller while preserving STOPPED_BY_USER."""
+    with open(temp_state_path, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.STOPPED_BY_USER.value}, f)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "macos.cli", "run"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1.0)
+    assert proc.poll() is None
+
+    ok, err = handoff_existing_manual_controller()
+    assert ok is True, f"Handoff failed: {err}"
+    assert proc.poll() is not None, "Manual controller process must be terminated"
+
+    with open(temp_state_path, "r", encoding="utf-8") as f:
+        assert json.load(f)["desired_state"] == DesiredState.STOPPED_BY_USER.value
+
+
+def test_bootout_failure_during_install_reports_error():
+    """Verifies that if an existing LaunchAgent fails to bootout, install reports failure."""
+    with patch("macos.lifecycle.is_service_loaded", return_value=True), \
+         patch("macos.lifecycle.bootout_service", return_value=False):
+        ok, err = install_launch_agent()
+        assert ok is False
+        assert "Failed to bootout existing LaunchAgent registration" in (err or "")
+
+
+def test_bootout_failure_during_uninstall_reports_error():
+    """Verifies that if bootout fails during uninstall, uninstall reports failure."""
+    with patch("macos.lifecycle.is_service_loaded", return_value=True), \
+         patch("macos.lifecycle.bootout_service", return_value=False):
+        ok, err = uninstall_launch_agent()
+        assert ok is False
+        assert "Failed to bootout LaunchAgent service from launchd" in (err or "")
+
+
+def test_plist_deletion_failure_during_uninstall_reports_error(tmp_path):
+    """Verifies that if removing plist fails, uninstall reports failure."""
+    test_plist = str(tmp_path / "test.plist")
+    with open(test_plist, "w") as f:
+        f.write("test")
+
+    with patch("macos.lifecycle.is_service_loaded", return_value=False), \
+         patch("os.remove", side_effect=OSError("Permission denied")):
+        ok, err = uninstall_launch_agent(plist_path=test_plist, remove_state=False)
+        assert ok is False
+        assert "Failed to remove LaunchAgent plist" in (err or "")
