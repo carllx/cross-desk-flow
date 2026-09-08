@@ -695,3 +695,278 @@ def test_successful_verified_recovery_clears_journal(isolated_env):
     ctrl.shutdown()
 
 
+def test_terminate_stale_child_inspection_exception_returns_false(isolated_env, monkeypatch):
+    """Browser Review Requirement 1: _terminate_stale_child() inspection exception -> False, not True.
+    Uncertainty must NEVER be interpreted as confirmed death.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    proc = subprocess.Popen(
+        [GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = proc.pid
+    time.sleep(0.5)
+    assert psutil.pid_exists(pid)
+
+    try:
+        ctrl = MacBridgeController(
+            state_file=state_file,
+            journal_file=journal_file,
+            lock_port=lock_port,
+            ipc_port=ipc_port,
+        )
+
+        child_info = {
+            "role": "speaker",
+            "pid": pid,
+            "create_time": psutil.Process(pid).create_time(),
+            "port": 5004,
+            "cmd_tokens": [GST_BIN, "-m", "udpsrc", "port=5004"],
+        }
+
+        # Simulate permission / inspection failure in psutil during final death check
+        orig_process = psutil.Process
+        def faulty_process(p_id):
+            if p_id == pid:
+                raise psutil.AccessDenied(pid=p_id, msg="Simulated permission error during inspection")
+            return orig_process(p_id)
+
+        monkeypatch.setattr(psutil, "Process", faulty_process)
+
+        # Must return False, not True!
+        result = ctrl._terminate_stale_child(pid, child_info)
+        assert result is False, "Uncertainty / inspection exception must return False, never True"
+    finally:
+        proc.kill()
+        proc.wait(timeout=2.0)
+
+
+def test_normal_stop_process_failure_retains_journal(isolated_env, monkeypatch):
+    """Browser Review Requirement 2: Normal stop_process() failure -> journal retained.
+    If stop_process returns False, PID and journal record must be preserved.
+    """
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    c1 = ctrl.process_runner.start_process([GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"])
+    ctrl._speaker_child_pid = c1
+    assert ctrl._record_child_started("speaker", c1, [GST_BIN, "-m", "udpsrc", "port=5004"], 5004)
+
+    assert psutil.pid_exists(c1)
+    assert os.path.exists(journal_file)
+
+    try:
+        # Simulate stop_process failure (e.g. process refused to terminate or psutil error)
+        monkeypatch.setattr(ctrl.process_runner, "stop_process", lambda p: False)
+
+        # Attempt to stop speaker child via controller
+        ok = ctrl._stop_child("speaker")
+        assert ok is False
+
+        # PID and journal must be retained
+        assert ctrl._speaker_child_pid == c1
+        with open(journal_file, "r", encoding="utf-8") as f:
+            j_data = json.load(f)
+        assert "speaker" in j_data.get("children", {})
+        assert j_data["children"]["speaker"]["pid"] == c1
+    finally:
+        ctrl.process_runner.stop_process(c1)
+        ctrl.shutdown()
+
+
+def test_stop_with_one_child_refusing_termination_returns_false_and_retains_evidence(isolated_env, monkeypatch):
+    """Browser Review Requirement 3: stop() with one child refusing termination -> returns False / evidence retained."""
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    c1 = ctrl.process_runner.start_process([GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"])
+    ctrl._speaker_child_pid = c1
+    assert ctrl._record_child_started("speaker", c1, [GST_BIN, "-m", "udpsrc", "port=5004"], 5004)
+
+    try:
+        # Simulate stop_process returning False
+        monkeypatch.setattr(ctrl.process_runner, "stop_process", lambda p: False)
+
+        # Explicit stop() must return False
+        ret = ctrl.stop()
+        assert ret is False
+        assert ctrl.get_status().controller_state == "ERROR"
+
+        # Ownership evidence must be retained
+        assert os.path.exists(journal_file)
+        with open(journal_file, "r", encoding="utf-8") as f:
+            j_data = json.load(f)
+        assert "speaker" in j_data.get("children", {})
+    finally:
+        ctrl.process_runner.stop_process(c1)
+        ctrl.shutdown()
+
+
+def test_shutdown_host_does_not_clear_unresolved_child_journal(isolated_env, monkeypatch):
+    """Browser Review Requirement 4: shutdown_host() does not clear unresolved child journal."""
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    c1 = ctrl.process_runner.start_process([GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"])
+    ctrl._speaker_child_pid = c1
+    assert ctrl._record_child_started("speaker", c1, [GST_BIN, "-m", "udpsrc", "port=5004"], 5004)
+
+    try:
+        # Simulate stop_process failure on speaker
+        monkeypatch.setattr(ctrl.process_runner, "stop_process", lambda p: False)
+
+        ctrl.shutdown_host()
+
+        # Journal file MUST exist and retain speaker child record
+        assert os.path.exists(journal_file)
+        with open(journal_file, "r", encoding="utf-8") as f:
+            j_data = json.load(f)
+        assert "speaker" in j_data.get("children", {})
+        assert j_data["children"]["speaker"]["pid"] == c1
+    finally:
+        ctrl.process_runner.stop_process(c1)
+        ctrl.shutdown()
+
+
+def test_failed_create_time_acquisition_terminates_child_and_fails_path(isolated_env, monkeypatch):
+    """Browser Review Requirement 5: Failed create_time acquisition after spawn -> child terminated and path FAILED."""
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+    assert ctrl.start_host()
+
+    class FakeDiscovery:
+        peer_available = True
+        peer_address = "127.0.0.1"
+        local_bind_address = "127.0.0.1"
+        peer_speaker_port = 5004
+        is_ambiguous = False
+        last_enumeration_error = None
+        def start(self): pass
+        def stop(self): pass
+        def broadcast_hello(self): pass
+
+    ctrl.discovery_service = FakeDiscovery()
+
+    # Simulate inability to get create_time from psutil
+    orig_process = psutil.Process
+    def faulty_process(p_id):
+        proc_obj = orig_process(p_id)
+        if p_id != os.getpid():
+            raise psutil.Error("Simulated inability to read create_time")
+        return proc_obj
+
+    monkeypatch.setattr(psutil, "Process", faulty_process)
+    # Also ensure process runner metadata does not supply create_time
+    monkeypatch.setattr(ctrl.process_runner, "get_child_metadata", lambda p: None)
+
+    ctrl.start()
+
+    status = ctrl.get_status()
+    assert status.speaker_path_state == "FAILED"
+    assert "journal" in (status.last_actionable_error or "").lower()
+
+    # The child must NOT be running
+    assert ctrl._speaker_child_pid is None
+    assert status.owned_children_count == 0
+
+    ctrl.shutdown()
+
+
+def test_journal_clear_failure_not_reported_as_successful_recovery(isolated_env, monkeypatch):
+    """Browser Review Requirement 6: Journal clear failure is not reported as successful clean recovery."""
+    state_file = isolated_env["state_file"]
+    journal_file = isolated_env["journal_file"]
+    lock_port = isolated_env["lock_port"]
+    ipc_port = isolated_env["ipc_port"]
+
+    proc = subprocess.Popen(
+        [GST_BIN, "-m", "udpsrc", "port=5004", "!", "fakesink"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = proc.pid
+    time.sleep(0.5)
+    assert psutil.pid_exists(pid)
+
+    p = psutil.Process(pid)
+    stale_journal = {
+        "version": 1,
+        "owner_pid": 9999999,
+        "owner_create_time": 1000.0,
+        "children": {
+            "speaker": {
+                "role": "speaker",
+                "pid": pid,
+                "create_time": p.create_time(),
+                "port": 5004,
+                "cmd_tokens": [GST_BIN, "-m", "udpsrc", "port=5004"],
+            }
+        },
+    }
+    with open(journal_file, "w", encoding="utf-8") as f:
+        json.dump(stale_journal, f)
+
+    ctrl = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+
+    # Simulate _clear_ownership_journal failing (e.g. permission error on unlinking)
+    monkeypatch.setattr(ctrl, "_clear_ownership_journal", lambda: False)
+
+    # Recovery must fail-closed!
+    assert not ctrl.start_host()
+    status = ctrl.get_status()
+    assert status.controller_state == "ERROR"
+    assert "failed to remove ownership journal file" in (status.last_actionable_error or "").lower()
+
+    ctrl.shutdown()
+
+
+

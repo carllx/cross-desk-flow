@@ -291,14 +291,57 @@ class MacBridgeController:
             logger.warning("Failed to remove ownership journal %s: %s", self.journal_file, exc)
             return False
 
+    def _stop_child(self, role: str) -> bool:
+        """Stops an owned child process, confirms its death, and updates journal.
+        
+        Returns True if process is confirmed dead and journal updated.
+        Returns False if termination could not be confirmed; retains PID and journal entry.
+        """
+        pid = self._speaker_child_pid if role == "speaker" else self._microphone_child_pid
+        if pid is None:
+            return True
+
+        stopped = self.process_runner.stop_process(pid)
+        if not stopped:
+            err_msg = f"Failed to confirm termination of owned {role} child [PID {pid}]; process still alive or unverified"
+            logger.error(err_msg)
+            if role == "speaker":
+                self._last_actionable_error = err_msg
+                self._speaker_path_state = PathState.FAILED
+            else:
+                self._last_actionable_microphone_error = err_msg
+                self._microphone_path_state = PathState.FAILED
+            return False
+
+        # Termination confirmed
+        self._record_child_stopped(role)
+        if role == "speaker":
+            self._speaker_child_pid = None
+        else:
+            self._microphone_child_pid = None
+        return True
+
     def _record_child_started(self, role: str, pid: int, cmd: List[str], port: int) -> bool:
-        """Records child startup in journal. Returns True on success; False if journal write fails."""
+        """Records child startup in journal with strict create_time verification.
+        
+        Returns True on success; False if create_time cannot be obtained or journal write fails.
+        """
         create_time = None
         try:
             import psutil
             create_time = psutil.Process(pid).create_time()
         except Exception:
             pass
+
+        # Also check runner metadata if psutil failed
+        if create_time is None and hasattr(self.process_runner, "get_child_metadata"):
+            meta = self.process_runner.get_child_metadata(pid)
+            if meta:
+                create_time = meta.get("create_time")
+
+        if create_time is None:
+            logger.error("Failed to acquire reliable create_time for spawned %s child [PID %d]; refusing journal record", role, pid)
+            return False
 
         owner_create_time = None
         try:
@@ -333,17 +376,21 @@ class MacBridgeController:
         }
         return self._write_ownership_journal(journal)
 
-    def _record_child_stopped(self, role: str) -> None:
-        """Removes a stopped child from journal only after its death is confirmed."""
+    def _record_child_stopped(self, role: str) -> bool:
+        """Removes a stopped child from journal only after its death is confirmed.
+        
+        Clears the journal file ONLY when no children remain.
+        """
         journal, err = self._load_ownership_journal()
         if not journal or err:
-            return
+            return True
         if "children" in journal:
             journal["children"].pop(role, None)
             if not journal["children"]:
-                self._clear_ownership_journal()
+                return self._clear_ownership_journal()
             else:
-                self._write_ownership_journal(journal)
+                return self._write_ownership_journal(journal)
+        return True
 
     def _verify_child_identity(self, pid: int, child_info: dict) -> Tuple[bool, Optional[str]]:
         """Verifies that a running process strictly matches recorded desk-audio-bridge GStreamer child.
@@ -392,7 +439,8 @@ class MacBridgeController:
     def _terminate_stale_child(self, pid: int, child_info: dict) -> bool:
         """Terminates stale verified child and confirms death.
         
-        Returns True ONLY if process is confirmed completely dead.
+        Returns True ONLY if process is confirmed completely dead / PID reused.
+        Returns False on any inspection error, permission failure, or if process remains alive.
         """
         try:
             import psutil
@@ -400,9 +448,13 @@ class MacBridgeController:
                 return True
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
         except Exception:
             try:
                 os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return True
             except Exception:
                 pass
 
@@ -412,8 +464,11 @@ class MacBridgeController:
                 import psutil
                 if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
                     return True
-            except Exception:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 return True
+            except Exception:
+                # Any inspection exception during wait -> cannot confirm death yet, continue loop
+                pass
             time.sleep(0.05)
 
         try:
@@ -422,32 +477,50 @@ class MacBridgeController:
                 try:
                     pgid = os.getpgid(pid)
                     os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return True
                 except Exception:
                     try:
                         os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        return True
                     except Exception:
                         pass
                 start_kill_t = time.time()
                 while time.time() - start_kill_t < 1.0:
-                    if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
+                    try:
+                        if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
+                            return True
+                    except (psutil.NoSuchProcess, ProcessLookupError):
                         return True
+                    except Exception:
+                        pass
                     time.sleep(0.05)
-        except Exception:
+        except (psutil.NoSuchProcess, ProcessLookupError):
             return True
+        except Exception:
+            pass
 
-        # Final death check
+        # Final death check: fail-closed on any error or uncertainty
         try:
             import psutil
-            if not psutil.pid_exists(pid) or not psutil.Process(pid).is_running():
+            if not psutil.pid_exists(pid):
+                return True
+            proc = psutil.Process(pid)
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
                 return True
             # Also check create_time in case of instantaneous PID reuse
-            proc = psutil.Process(pid)
             exp_time = child_info.get("create_time")
             if exp_time is not None and abs(proc.create_time() - exp_time) > 1.0:
                 return True
+            # Process is still running and is the same process
             return False
-        except Exception:
+        except (psutil.NoSuchProcess, ProcessLookupError):
             return True
+        except Exception as exc:
+            # Inspection exception / permission failure -> fail closed!
+            logger.warning("Uncertainty during death confirmation for PID %d (%s); failing closed", pid, exc)
+            return False
 
     def _recover_stale_owned_children(self) -> Tuple[bool, Optional[str]]:
         """Recovers and terminates verified orphaned child processes left by previous abnormal controller death.
@@ -553,7 +626,10 @@ class MacBridgeController:
             return False, first_failure_reason
 
         # All entries safely resolved: clear journal
-        self._clear_ownership_journal()
+        if not self._clear_ownership_journal():
+            err_msg = "All children resolved but failed to remove ownership journal file; failing closed"
+            logger.error(err_msg)
+            return False, err_msg
         return True, None
 
 
@@ -683,10 +759,9 @@ class MacBridgeController:
         with self._lock:
             self._microphone_desired = enabled
             if not enabled:
-                if self._microphone_child_pid is not None:
-                    self.process_runner.stop_process(self._microphone_child_pid)
-                    self._record_child_stopped("microphone")
-                    self._microphone_child_pid = None
+                stopped = self._stop_child("microphone")
+                if not stopped:
+                    return False
                 self._microphone_path_state = PathState.STOPPED
                 self._last_actionable_microphone_error = None
                 return True
@@ -702,28 +777,30 @@ class MacBridgeController:
             self._persist_desired_state(DesiredState.STOPPED_BY_USER)
 
             # Stop owned speaker pipeline child
-            if self._speaker_child_pid is not None:
-                self.process_runner.stop_process(self._speaker_child_pid)
-                self._record_child_stopped("speaker")
-                self._speaker_child_pid = None
-            self._active_peer_address = None
-            self._active_local_bind = None
-            self._speaker_path_state = PathState.STOPPED
+            spk_stopped = self._stop_child("speaker")
+            if spk_stopped:
+                self._active_peer_address = None
+                self._active_local_bind = None
+                self._speaker_path_state = PathState.STOPPED
 
             # Stop owned microphone pipeline child
-            if self._microphone_child_pid is not None:
-                self.process_runner.stop_process(self._microphone_child_pid)
-                self._record_child_stopped("microphone")
-                self._microphone_child_pid = None
-            self._microphone_path_state = PathState.STOPPED
+            mic_stopped = self._stop_child("microphone")
+            if mic_stopped:
+                self._microphone_path_state = PathState.STOPPED
 
             if hasattr(self.process_runner, "stop_all_owned"):
                 self.process_runner.stop_all_owned()
 
-            self._clear_ownership_journal()
-
             # Stop discovery
             self.discovery_service.stop()
+
+            if not spk_stopped or not mic_stopped:
+                self._controller_state = LifecycleState.ERROR
+                err_msg = "Stop failed: one or more owned child processes could not be confirmed stopped"
+                if not self._last_actionable_error:
+                    self._last_actionable_error = err_msg
+                logger.error(err_msg)
+                return False
 
             self._controller_state = LifecycleState.STOPPED
             return True
@@ -732,25 +809,19 @@ class MacBridgeController:
         """Shuts down the controller host process without mutating persisted user desired state."""
         with self._lock:
             # Stop owned speaker pipeline child
-            if self._speaker_child_pid is not None:
-                self.process_runner.stop_process(self._speaker_child_pid)
-                self._record_child_stopped("speaker")
-                self._speaker_child_pid = None
-            self._active_peer_address = None
-            self._active_local_bind = None
-            self._speaker_path_state = PathState.STOPPED
+            spk_stopped = self._stop_child("speaker")
+            if spk_stopped:
+                self._active_peer_address = None
+                self._active_local_bind = None
+                self._speaker_path_state = PathState.STOPPED
 
             # Stop owned microphone pipeline child
-            if self._microphone_child_pid is not None:
-                self.process_runner.stop_process(self._microphone_child_pid)
-                self._record_child_stopped("microphone")
-                self._microphone_child_pid = None
-            self._microphone_path_state = PathState.STOPPED
+            mic_stopped = self._stop_child("microphone")
+            if mic_stopped:
+                self._microphone_path_state = PathState.STOPPED
 
             if hasattr(self.process_runner, "stop_all_owned"):
                 self.process_runner.stop_all_owned()
-
-            self._clear_ownership_journal()
 
             # Stop discovery
             self.discovery_service.stop()
@@ -758,7 +829,10 @@ class MacBridgeController:
             # Stop IPC server & release singleton lock
             self._ipc_server.stop()
             self._singleton_lock.release()
-            self._controller_state = LifecycleState.STOPPED
+            if not spk_stopped or not mic_stopped:
+                self._controller_state = LifecycleState.ERROR
+            else:
+                self._controller_state = LifecycleState.STOPPED
 
 
     def shutdown(self) -> None:
@@ -836,14 +910,10 @@ class MacBridgeController:
 
             # 1. Controller STOPPED_BY_USER -> Stop both speaker and microphone
             if self._desired_state == DesiredState.STOPPED_BY_USER:
-                if self._speaker_child_pid is not None:
-                    self.process_runner.stop_process(self._speaker_child_pid)
-                    self._record_child_stopped("speaker")
-                    self._speaker_child_pid = None
-                if self._microphone_child_pid is not None:
-                    self.process_runner.stop_process(self._microphone_child_pid)
-                    self._record_child_stopped("microphone")
-                    self._microphone_child_pid = None
+                self._stop_child("speaker")
+                self._stop_child("microphone")
+                self._active_peer_address = None
+                self._active_local_bind = None
                 self._speaker_path_state = PathState.STOPPED
                 self._microphone_path_state = PathState.STOPPED
                 self._controller_state = LifecycleState.STOPPED
@@ -855,17 +925,11 @@ class MacBridgeController:
                     "Multiple opposite-role responders discovered; manual peer selection required"
                 )
                 self._controller_state = LifecycleState.AMBIGUOUS_PEER
-                if self._speaker_child_pid is not None:
-                    self.process_runner.stop_process(self._speaker_child_pid)
-                    self._record_child_stopped("speaker")
-                    self._speaker_child_pid = None
+                if self._stop_child("speaker"):
                     self._active_peer_address = None
                     self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
-                if self._microphone_child_pid is not None:
-                    self.process_runner.stop_process(self._microphone_child_pid)
-                    self._record_child_stopped("microphone")
-                    self._microphone_child_pid = None
+                if self._stop_child("microphone"):
                     self._microphone_path_state = PathState.IDLE
                 return
 
@@ -874,10 +938,7 @@ class MacBridgeController:
                 self._last_actionable_error = "GStreamer binary not found at configured path"
                 self._controller_state = LifecycleState.ERROR
                 self._speaker_path_state = PathState.FAILED
-                if self._microphone_child_pid is not None:
-                    self.process_runner.stop_process(self._microphone_child_pid)
-                    self._record_child_stopped("microphone")
-                    self._microphone_child_pid = None
+                if self._stop_child("microphone"):
                     self._microphone_path_state = PathState.IDLE
                 return
 
@@ -889,17 +950,11 @@ class MacBridgeController:
                 if disc_err:
                     self._last_actionable_error = disc_err
                     self._controller_state = LifecycleState.ERROR
-                if self._speaker_child_pid is not None:
-                    self.process_runner.stop_process(self._speaker_child_pid)
-                    self._record_child_stopped("speaker")
-                    self._speaker_child_pid = None
+                if self._stop_child("speaker"):
                     self._active_peer_address = None
                     self._active_local_bind = None
                     self._speaker_path_state = PathState.IDLE
-                if self._microphone_child_pid is not None:
-                    self.process_runner.stop_process(self._microphone_child_pid)
-                    self._record_child_stopped("microphone")
-                    self._microphone_child_pid = None
+                if self._stop_child("microphone"):
                     self._microphone_path_state = PathState.IDLE
                 return
 
@@ -968,14 +1023,12 @@ class MacBridgeController:
     def _reconcile_microphone(self) -> None:
         """Idempotently reconciles the macOS microphone sender path."""
         if not self._microphone_desired:
-            if self._microphone_child_pid is not None:
-                self.process_runner.stop_process(self._microphone_child_pid)
-                self._record_child_stopped("microphone")
-                self._microphone_child_pid = None
-            if self._desired_state == DesiredState.STOPPED_BY_USER:
-                self._microphone_path_state = PathState.STOPPED
-            else:
-                self._microphone_path_state = PathState.IDLE
+            mic_stopped = self._stop_child("microphone")
+            if mic_stopped:
+                if self._desired_state == DesiredState.STOPPED_BY_USER:
+                    self._microphone_path_state = PathState.STOPPED
+                else:
+                    self._microphone_path_state = PathState.IDLE
             return
 
         # Microphone is desired: check if pipeline already running
