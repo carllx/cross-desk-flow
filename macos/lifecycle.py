@@ -65,7 +65,6 @@ def generate_launch_agent_plist(
         "WorkingDirectory": repo_root,
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ThrottleInterval": 2,
         "StandardOutPath": stdout_log,
         "StandardErrorPath": stderr_log,
         "EnvironmentVariables": {

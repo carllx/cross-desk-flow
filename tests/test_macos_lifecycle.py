@@ -65,7 +65,7 @@ def test_plist_generation_structure():
     assert plist_dict["WorkingDirectory"] == "/dummy/repo"
     assert plist_dict["RunAtLoad"] is True
     assert plist_dict["KeepAlive"] is True
-    assert plist_dict["ThrottleInterval"] == 2
+    assert "ThrottleInterval" not in plist_dict
     assert "EnvironmentVariables" in plist_dict
     assert plist_dict["EnvironmentVariables"]["PYTHONUNBUFFERED"] == "1"
     assert plist_dict["EnvironmentVariables"]["PYTHONPATH"] == "/dummy/repo"
@@ -202,9 +202,12 @@ def test_manual_controller_handoff_enabled(temp_state_path):
     with open(temp_state_path, "w", encoding="utf-8") as f:
         json.dump({"desired_state": DesiredState.ENABLED.value}, f)
 
-    # Launch manual controller in subprocess
+    # Launch manual controller in subprocess with isolated state file
+    env = dict(os.environ)
+    env["DESK_AUDIO_BRIDGE_STATE_FILE"] = temp_state_path
     proc = subprocess.Popen(
         [sys.executable, "-m", "macos.cli", "run"],
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -226,8 +229,11 @@ def test_manual_controller_handoff_stopped_by_user(temp_state_path):
     with open(temp_state_path, "w", encoding="utf-8") as f:
         json.dump({"desired_state": DesiredState.STOPPED_BY_USER.value}, f)
 
+    env = dict(os.environ)
+    env["DESK_AUDIO_BRIDGE_STATE_FILE"] = temp_state_path
     proc = subprocess.Popen(
         [sys.executable, "-m", "macos.cli", "run"],
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
