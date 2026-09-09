@@ -69,19 +69,22 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
     last_mic_error = status_payload.get("last_actionable_microphone_error")
 
     # Map directions
-    def map_path(path_state: str) -> str:
+    DIR_OFF = "Off"
+    def map_path(path_state: str, is_mic: bool = False) -> str:
         if path_state == "RUNNING":
             return DIR_ACTIVE
         elif path_state in ("FAILED", "UNAVAILABLE"):
             return DIR_PROBLEM
         elif path_state == "STOPPED":
             return DIR_STOPPED
-        elif path_state in ("STARTING", "READY", "IDLE"):
+        elif path_state == "IDLE":
+            return DIR_OFF if is_mic else DIR_STOPPED
+        elif path_state in ("STARTING", "READY"):
             return DIR_WAITING
         return DIR_PROBLEM
 
-    spk_ui = map_path(speaker_path)
-    mic_ui = map_path(mic_path)
+    spk_ui = map_path(speaker_path, is_mic=False)
+    mic_ui = map_path(mic_path, is_mic=True)
 
     # 1. STOPPED_BY_USER
     if desired_state == "STOPPED_BY_USER":
@@ -124,12 +127,30 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             action_required_message=None,
         )
 
-    # 5. One direction failed / unavailable / starting -> Degraded
+    # 4b. Playback mode: speaker RUNNING and mic IDLE / STOPPED -> Connected
+    if speaker_path == "RUNNING" and mic_path in ("IDLE", "STOPPED", "READY"):
+        return UIState(
+            overall_status=STATUS_CONNECTED,
+            overall_detail="Speaker active (Playback mode)",
+            speaker_status=DIR_ACTIVE,
+            microphone_status=DIR_OFF,
+            action_required_message=None,
+        )
+
+    # 4c. Dictation mode: mic RUNNING and speaker STOPPED / IDLE -> Connected
+    if mic_path == "RUNNING" and speaker_path in ("IDLE", "STOPPED", "READY"):
+        return UIState(
+            overall_status=STATUS_CONNECTED,
+            overall_detail="Microphone active (Dictation mode)",
+            speaker_status=DIR_STOPPED,
+            microphone_status=DIR_ACTIVE,
+            action_required_message=None,
+        )
+
+    # 5. One direction failed / unavailable -> Degraded
     if (
         speaker_path in ("FAILED", "UNAVAILABLE")
         or mic_path in ("FAILED", "UNAVAILABLE")
-        or (speaker_path == "RUNNING" and mic_path != "RUNNING")
-        or (mic_path == "RUNNING" and speaker_path != "RUNNING")
     ):
         detail = "One or more audio paths degraded"
         if speaker_path in ("FAILED", "UNAVAILABLE"):

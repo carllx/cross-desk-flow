@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, List, Optional, Tuple
 
 from bridge_core.contract import (
+    CONTROL_PROTOCOL_VERSION,
     DEFAULT_LOCAL_IPC_PORT,
     DEFAULT_MIC_RTP_PORT,
     DEFAULT_SINGLETON_PORT,
@@ -233,11 +234,13 @@ class MacBridgeController:
         self._active_peer_address: Optional[str] = None
         self._active_local_bind: Optional[str] = None
 
-        # Microphone path state & desired state
-        self._microphone_desired: bool = (self._desired_state == DesiredState.ENABLED)
+        # Microphone path state & desired state:
+        # Under Issue #43 Playback/Dictation baseline, microphone defaults to False
+        self._microphone_desired: bool = False
         self._microphone_path_state = PathState.IDLE
         self._microphone_child_pid: Optional[int] = None
         self._last_actionable_microphone_error: Optional[str] = None
+        self._current_dictation_session: Optional[str] = None
         self._lock = threading.RLock()
 
         # Wire discovery service for HostRole.MACOS
@@ -245,7 +248,79 @@ class MacBridgeController:
             local_role=HostRole.MACOS,
             instance_id=f"mac-{os.getpid()}-{int(time.time())}",
             on_peer_discovered=self._on_peer_discovered,
+            on_control_message=self._on_control_message,
         )
+
+    def _on_control_message(self, msg: dict, peer_ip: str) -> None:
+        """Handles incoming DICTATION_* control packets from verified elected peer."""
+        msg_type = msg.get("type")
+        session_id = msg.get("session_id")
+        if not session_id:
+            return
+
+        with self._lock:
+            if msg_type == "DICTATION_START":
+                # Reject if stopped by user
+                if self._desired_state == DesiredState.STOPPED_BY_USER:
+                    self.discovery_service.send_control_message(peer_ip, {
+                        "version": CONTROL_PROTOCOL_VERSION,
+                        "role": HostRole.MACOS.value,
+                        "instance_id": self.discovery_service.instance_id,
+                        "type": "DICTATION_START_ACK",
+                        "session_id": session_id,
+                        "success": False,
+                        "error": "macOS host is stopped by user",
+                    })
+                    return
+
+                # If duplicate start with same session_id and mic already running: idempotent
+                if (
+                    self._current_dictation_session == session_id
+                    and self._microphone_child_pid is not None
+                    and self.process_runner.is_running(self._microphone_child_pid)
+                ):
+                    self.discovery_service.send_control_message(peer_ip, {
+                        "version": CONTROL_PROTOCOL_VERSION,
+                        "role": HostRole.MACOS.value,
+                        "instance_id": self.discovery_service.instance_id,
+                        "type": "DICTATION_START_ACK",
+                        "session_id": session_id,
+                        "success": True,
+                        "state": PathState.RUNNING.value,
+                    })
+                    return
+
+                # If new session: ensure any prior microphone child is cleanly terminated
+                if self._microphone_child_pid is not None:
+                    self._stop_child("microphone")
+                    self._microphone_child_pid = None
+
+                self._current_dictation_session = session_id
+                ok = self.set_microphone_enabled(True)
+                status = self.get_status()
+                self.discovery_service.send_control_message(peer_ip, {
+                    "version": CONTROL_PROTOCOL_VERSION,
+                    "role": HostRole.MACOS.value,
+                    "instance_id": self.discovery_service.instance_id,
+                    "type": "DICTATION_START_ACK",
+                    "session_id": session_id,
+                    "success": ok,
+                    "state": status.microphone_path_state,
+                    "error": status.last_actionable_microphone_error,
+                })
+
+            elif msg_type == "DICTATION_STOP":
+                self.set_microphone_enabled(False)
+                self._current_dictation_session = None
+                self.discovery_service.send_control_message(peer_ip, {
+                    "version": CONTROL_PROTOCOL_VERSION,
+                    "role": HostRole.MACOS.value,
+                    "instance_id": self.discovery_service.instance_id,
+                    "type": "DICTATION_STOP_ACK",
+                    "session_id": session_id,
+                    "success": True,
+                })
+
 
     def _load_ownership_journal(self) -> Tuple[Optional[dict], Optional[str]]:
         """Loads ownership journal.
@@ -705,7 +780,7 @@ class MacBridgeController:
                 self._microphone_desired = False
             else:
                 self._controller_state = LifecycleState.STARTING
-                self._microphone_desired = True
+                self._microphone_desired = False
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
 
@@ -754,10 +829,11 @@ class MacBridgeController:
 
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
-            self._microphone_desired = True
+            self._microphone_desired = False
             self._controller_state = LifecycleState.STARTING
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
+
 
             # Start IPC server
             self._ipc_server.start()
@@ -780,7 +856,11 @@ class MacBridgeController:
                 stopped = self._stop_child("microphone")
                 if not stopped:
                     return False
-                self._microphone_path_state = PathState.STOPPED
+                self._microphone_path_state = (
+                    PathState.STOPPED
+                    if self._desired_state == DesiredState.STOPPED_BY_USER
+                    else PathState.IDLE
+                )
                 self._last_actionable_microphone_error = None
                 return True
 

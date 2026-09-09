@@ -253,10 +253,9 @@ def test_explicit_start_and_stop_persist_intent(temp_state_file):
         ctrl.shutdown_host()
 
 
-def test_start_host_enabled_restores_microphone_intent_and_runs_both_media_children(temp_state_file):
-    """Under pre-#22 dual-active policy, start_host on persisted ENABLED restores microphone intent
-
-    and runs both speaker and microphone media children if Pack43 is available.
+def test_start_host_enabled_defaults_to_playback_mode(temp_state_file):
+    """Under Issue #43 Dictation MVP policy, start_host on persisted ENABLED defaults to PLAYBACK mode
+    (speaker running, microphone OFF/not started, 1 media child).
     """
     with open(temp_state_file, "w", encoding="utf-8") as f:
         json.dump({"desired_state": DesiredState.ENABLED.value}, f)
@@ -301,10 +300,11 @@ def test_start_host_enabled_restores_microphone_intent_and_runs_both_media_child
         assert ok is True
         st = ctrl.get_status()
         assert st.desired_state == DesiredState.ENABLED.value
+        assert st.mode == "PLAYBACK"
         assert st.speaker_path_state == PathState.RUNNING.value
-        assert st.microphone_path_state == PathState.RUNNING.value
-        assert st.owned_children_count == 2
-        assert len(runner.running_pids) == 2
+        assert st.microphone_path_state == PathState.READY.value
+        assert st.owned_children_count == 1
+        assert len(runner.running_pids) == 1
 
         ctrl.shutdown_host()
 

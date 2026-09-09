@@ -41,11 +41,16 @@ OVERALL_DEGRADED = "Degraded"
 OVERALL_STOPPED = "Stopped"
 OVERALL_ACTION_REQUIRED = "Action required"
 
+# Mode constants
+MODE_PLAYBACK = "Playback"
+MODE_DICTATION = "Dictation"
+
 # Direction row status constants
 DIRECTION_ACTIVE = "Active"
 DIRECTION_WAITING = "Waiting"
 DIRECTION_STOPPED = "Stopped"
 DIRECTION_PROBLEM = "Problem"
+DIRECTION_OFF = "Off"
 
 
 @dataclass
@@ -54,6 +59,7 @@ class ShellState:
     overall: str
     speaker: str
     microphone: str
+    mode: str = MODE_PLAYBACK
     actionable_error: Optional[str] = None
     raw_status: Optional[Dict[str, Any]] = None
 
@@ -69,6 +75,7 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
             overall=OVERALL_ACTION_REQUIRED,
             speaker=DIRECTION_STOPPED,
             microphone=DIRECTION_STOPPED,
+            mode=MODE_PLAYBACK,
             actionable_error="Background service is not running",
             raw_status=None,
         )
@@ -78,6 +85,14 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
     peer_available = bool(status_dict.get("peer_available", False))
     spk_state = status_dict.get("speaker_path_state")
     mic_state = status_dict.get("microphone_path_state")
+
+    # Mode determination
+    has_explicit_mode = "mode" in status_dict
+    raw_mode = (status_dict.get("mode") or "").upper()
+    if raw_mode == "DICTATION" or (not has_explicit_mode and mic_state == "RUNNING" and spk_state != "RUNNING"):
+        current_mode = MODE_DICTATION
+    else:
+        current_mode = MODE_PLAYBACK
 
     # Collect actionable errors
     spk_err = status_dict.get("last_actionable_error")
@@ -91,6 +106,7 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
             overall=OVERALL_STOPPED,
             speaker=DIRECTION_STOPPED,
             microphone=DIRECTION_STOPPED,
+            mode=MODE_PLAYBACK,
             actionable_error=actionable_error,
             raw_status=status_dict,
         )
@@ -106,14 +122,26 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
         speaker_row = DIRECTION_WAITING
 
     # Map microphone direction row
-    if mic_state == "RUNNING":
-        microphone_row = DIRECTION_ACTIVE
-    elif mic_state in ("UNAVAILABLE", "FAILED"):
-        microphone_row = DIRECTION_PROBLEM
-    elif mic_state == "STOPPED":
-        microphone_row = DIRECTION_STOPPED
+    if current_mode == MODE_DICTATION:
+        if mic_state == "RUNNING":
+            microphone_row = DIRECTION_ACTIVE
+        elif mic_state in ("UNAVAILABLE", "FAILED"):
+            microphone_row = DIRECTION_PROBLEM
+        elif mic_state == "STOPPED":
+            microphone_row = DIRECTION_STOPPED
+        else:
+            microphone_row = DIRECTION_WAITING
     else:
-        microphone_row = DIRECTION_WAITING
+        # In Playback mode: Mac -> PC Microphone is Off
+        if mic_state in ("UNAVAILABLE", "FAILED"):
+            microphone_row = DIRECTION_PROBLEM
+        elif mic_state == "RUNNING":
+            microphone_row = DIRECTION_ACTIVE
+        elif not has_explicit_mode and not peer_available:
+            microphone_row = DIRECTION_WAITING
+        else:
+            microphone_row = DIRECTION_OFF
+
 
     # Determine overall status
     if controller_state == "ERROR" and speaker_row != DIRECTION_ACTIVE and microphone_row != DIRECTION_ACTIVE:
@@ -122,9 +150,13 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
         overall = OVERALL_WAITING_FOR_MAC
     elif speaker_row == DIRECTION_ACTIVE and microphone_row == DIRECTION_ACTIVE:
         overall = OVERALL_CONNECTED
-    elif (speaker_row == DIRECTION_ACTIVE and microphone_row in (DIRECTION_PROBLEM, DIRECTION_STOPPED, DIRECTION_WAITING)) or \
-         (microphone_row == DIRECTION_ACTIVE and speaker_row in (DIRECTION_PROBLEM, DIRECTION_STOPPED, DIRECTION_WAITING)):
+    elif (speaker_row == DIRECTION_ACTIVE and microphone_row == DIRECTION_PROBLEM) or \
+         (microphone_row == DIRECTION_ACTIVE and speaker_row == DIRECTION_PROBLEM):
         overall = OVERALL_DEGRADED
+    elif current_mode == MODE_PLAYBACK and speaker_row == DIRECTION_ACTIVE:
+        overall = OVERALL_CONNECTED
+    elif current_mode == MODE_DICTATION and microphone_row == DIRECTION_ACTIVE:
+        overall = OVERALL_CONNECTED
     elif speaker_row == DIRECTION_PROBLEM or microphone_row == DIRECTION_PROBLEM:
         overall = OVERALL_ACTION_REQUIRED
     elif speaker_row == DIRECTION_WAITING or microphone_row == DIRECTION_WAITING:
@@ -136,9 +168,11 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
         overall=overall,
         speaker=speaker_row,
         microphone=microphone_row,
+        mode=current_mode,
         actionable_error=actionable_error,
         raw_status=status_dict,
     )
+
 
 
 class ProductShellClient:
@@ -160,6 +194,12 @@ class ProductShellClient:
     def stop(self) -> Optional[Dict[str, Any]]:
         return send_ipc_command("stop", port=self.port, timeout=2.0)
 
+    def start_dictation(self) -> Optional[Dict[str, Any]]:
+        return send_ipc_command("dictation-start", port=self.port, timeout=4.0)
+
+    def end_dictation(self) -> Optional[Dict[str, Any]]:
+        return send_ipc_command("dictation-end", port=self.port, timeout=3.0)
+
 
 class ProductShellApp:
     """Tkinter Desktop Window for Cross-Desk Flow."""
@@ -176,8 +216,8 @@ class ProductShellApp:
 
     def _setup_window(self):
         self.root.title("Cross-Desk Flow")
-        self.root.geometry("440x330")
-        self.root.minsize(400, 310)
+        self.root.geometry("460x360")
+        self.root.minsize(420, 330)
         self.root.configure(bg="#f8fafc")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -224,6 +264,16 @@ class ProductShellApp:
             anchor="w",
         )
         self.overall_label.pack(fill=tk.X, pady=(2, 0))
+
+        self.mode_label = tk.Label(
+            status_card,
+            text="Mode: Playback",
+            font=("Segoe UI", 10, "bold"),
+            fg="#2563eb",
+            bg="#ffffff",
+            anchor="w",
+        )
+        self.mode_label.pack(fill=tk.X, pady=(2, 0))
 
         # Direction Rows Card
         directions_card = tk.Frame(
@@ -328,7 +378,7 @@ class ProductShellApp:
             activebackground="#1d4ed8",
             activeforeground="#ffffff",
             relief=tk.FLAT,
-            padx=16,
+            padx=12,
             pady=6,
             cursor="hand2",
             command=self.on_start,
@@ -344,12 +394,28 @@ class ProductShellApp:
             activebackground="#cbd5e1",
             activeforeground="#1e293b",
             relief=tk.FLAT,
-            padx=16,
+            padx=12,
             pady=6,
             cursor="hand2",
             command=self.on_stop,
         )
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.dictation_btn = tk.Button(
+            btn_frame,
+            text="Start Dictation",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0284c7",
+            fg="#ffffff",
+            activebackground="#0369a1",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+            command=self.on_dictation_toggle,
+        )
+        self.dictation_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.refresh_btn = tk.Button(
             btn_frame,
@@ -360,7 +426,7 @@ class ProductShellApp:
             activebackground="#e2e8f0",
             activeforeground="#1e293b",
             relief=tk.FLAT,
-            padx=12,
+            padx=10,
             pady=6,
             cursor="hand2",
             command=self.on_refresh,
@@ -375,7 +441,7 @@ class ProductShellApp:
             return "#b45309", "#fef3c7"  # Amber
         elif status == OVERALL_DEGRADED:
             return "#c2410c", "#ffedd5"  # Orange/Amber
-        elif status in (OVERALL_STOPPED, DIRECTION_STOPPED):
+        elif status in (OVERALL_STOPPED, DIRECTION_STOPPED, DIRECTION_OFF):
             return "#475569", "#f1f5f9"  # Slate/Gray
         elif status in (OVERALL_ACTION_REQUIRED, DIRECTION_PROBLEM):
             return "#b91c1c", "#fee2e2"  # Red
@@ -390,6 +456,12 @@ class ProductShellApp:
         fg, bg = self._get_badge_colors(state.overall)
         self.overall_label.config(text=state.overall, fg=fg)
 
+        # Update mode label
+        self.mode_label.config(
+            text=f"Mode: {state.mode}",
+            fg="#7c3aed" if state.mode == MODE_DICTATION else "#2563eb",
+        )
+
         # Update PC -> Mac Speaker row
         spk_fg, spk_bg = self._get_badge_colors(state.speaker)
         self.spk_status_label.config(text=state.speaker, fg=spk_fg, bg=spk_bg)
@@ -398,12 +470,36 @@ class ProductShellApp:
         mic_fg, mic_bg = self._get_badge_colors(state.microphone)
         self.mic_status_label.config(text=state.microphone, fg=mic_fg, bg=mic_bg)
 
+        # Update dictation button
+        if state.mode == MODE_DICTATION:
+            self.dictation_btn.config(
+                text="End Dictation",
+                bg="#dc2626",
+                activebackground="#b91c1c",
+            )
+        else:
+            self.dictation_btn.config(
+                text="Start Dictation",
+                bg="#0284c7",
+                activebackground="#0369a1",
+            )
+
         # Update actionable error notice
         if state.actionable_error:
             self.error_label.config(text=state.actionable_error)
             self.error_frame.pack(fill=tk.X, pady=(0, 8), before=self.start_btn.master)
         else:
             self.error_frame.pack_forget()
+
+    def on_dictation_toggle(self):
+        """IPC dictation start/end toggle callback."""
+        btn_text = self.dictation_btn.cget("text")
+        if btn_text == "End Dictation":
+            self.client.end_dictation()
+        else:
+            self.client.start_dictation()
+        self.refresh()
+
 
     def _schedule_refresh(self):
         """Schedules auto-refresh approximately every 1 second."""

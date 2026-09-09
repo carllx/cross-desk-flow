@@ -25,7 +25,7 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from bridge_core.contract import (
     CONTROL_PROTOCOL_VERSION,
@@ -308,6 +308,7 @@ class PeerDiscoveryService:
         interface_classifier: Optional[InterfaceClassifier] = None,
         on_peer_discovered: Optional[Callable[[str, str, int, str], None]] = None,
         on_peer_lost: Optional[Callable[[], None]] = None,
+        on_control_message: Optional[Callable[[dict, str], None]] = None,
         election_delay: float = 0.25,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     ):
@@ -325,6 +326,8 @@ class PeerDiscoveryService:
         self.classifier = interface_classifier or InterfaceClassifier()
         self.on_peer_discovered = on_peer_discovered
         self.on_peer_lost = on_peer_lost
+        self.on_control_message = on_control_message
+
 
         self._running = False
         self._listener_sock: Optional[socket.socket] = None
@@ -545,12 +548,68 @@ class PeerDiscoveryService:
                 if sock:
                     sock.close()
 
-    def handle_peer_message(self, msg: dict, peer_ip: str) -> None:
+    def send_control_message(self, peer_ip: str, message: dict) -> bool:
+        """Sends a directed DICTATION control packet to elected peer on port 50100."""
+        with self._lock:
+            if not self._running:
+                return False
+            if peer_ip != self._peer_address:
+                logger.warning("Cannot send control message: %s does not match elected peer %s", peer_ip, self._peer_address)
+                return False
+            sock = self._listener_sock
+            if not sock:
+                return False
+
+        data = json.dumps(message).encode("utf-8")
+        try:
+            sock.sendto(data, (peer_ip, self.control_port))
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send control message to %s: %s", peer_ip, exc)
+            return False
+
+    def handle_peer_message(self, msg: Any, peer_ip: str) -> None:
         """Processes an incoming peer packet (used by both _listen_loop and automated tests)."""
+        if isinstance(msg, (bytes, bytearray)):
+            try:
+                msg = json.loads(msg.decode("utf-8"))
+            except Exception:
+                return
+        if not isinstance(msg, dict):
+            return
+
         msg_role = msg.get("role")
         version = msg.get("version")
         if version != CONTROL_PROTOCOL_VERSION or msg_role != self.target_role.value:
             return
+
+        msg_type = msg.get("type", "")
+        if isinstance(msg_type, str) and msg_type.startswith("DICTATION_"):
+            # 50100 control/discovery separation:
+            # DICTATION control packets are branched BEFORE discovery logic.
+            # They MUST NOT update _known_responders, _peer_candidates, route election,
+            # discovery liveness, or trigger discovery ACKs.
+            with self._lock:
+                if self._is_ambiguous or not self._peer_address or not self._peer_instance_id:
+                    logger.debug("Dropping DICTATION message: peer ambiguous or not yet elected")
+                    return
+                # Peer validation: verify source IP corresponds to current elected peer address
+                if peer_ip != self._peer_address:
+                    logger.warning("Dropping DICTATION message from non-elected IP %s (elected %s)", peer_ip, self._peer_address)
+                    return
+                # Peer validation: verify sender instance_id matches selected peer_instance_id
+                sender_inst = msg.get("instance_id")
+                if sender_inst != self._peer_instance_id:
+                    logger.warning("Dropping DICTATION message from unverified instance %s (elected %s)", sender_inst, self._peer_instance_id)
+                    return
+
+            if self.on_control_message:
+                try:
+                    self.on_control_message(msg, peer_ip)
+                except Exception as exc:
+                    logger.warning("Error in on_control_message callback: %s", exc)
+            return
+
 
         peer_inst = msg.get("instance_id", "")
         peer_spk_port = msg.get("speaker_port", DEFAULT_SPEAKER_RTP_PORT)

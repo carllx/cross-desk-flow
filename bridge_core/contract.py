@@ -103,6 +103,15 @@ class ControllerStatus:
     microphone_port: int = DEFAULT_MIC_RTP_PORT
     pack43_available: Optional[bool] = None
     last_actionable_microphone_error: Optional[str] = None
+    mode: str = "PLAYBACK"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# Dictation Control Plane Protocol Constants (Port 50100)
+DICTATION_START = "DICTATION_START"
+DICTATION_START_ACK = "DICTATION_START_ACK"
+DICTATION_STOP = "DICTATION_STOP"
+DICTATION_STOP_ACK = "DICTATION_STOP_ACK"
+

@@ -158,7 +158,27 @@ class LocalControlServer:
                 elif cmd == "mic-disable":
                     success = self.controller.set_microphone_enabled(False)
                     res = {"success": success, "microphone_path_state": self.controller.get_status().microphone_path_state}
+                elif cmd == "dictation-start":
+                    success = self.controller.start_dictation()
+                    st = self.controller.get_status()
+                    res = {
+                        "success": success,
+                        "mode": st.mode,
+                        "microphone_path_state": st.microphone_path_state,
+                        "speaker_path_state": st.speaker_path_state,
+                        "error": st.last_actionable_microphone_error or st.last_actionable_error,
+                    }
+                elif cmd == "dictation-end":
+                    success = self.controller.end_dictation()
+                    st = self.controller.get_status()
+                    res = {
+                        "success": success,
+                        "mode": st.mode,
+                        "microphone_path_state": st.microphone_path_state,
+                        "speaker_path_state": st.speaker_path_state,
+                    }
                 elif cmd == "shutdown":
+
                     # Request graceful host shutdown via main loop: do not mutate desired state
                     self.controller.request_host_shutdown()
                     res = {"success": True}
@@ -212,12 +232,18 @@ class WindowsBridgeController:
         self._active_peer_address: Optional[str] = None
         self._active_local_bind: Optional[str] = None
 
-        # Microphone path state & desired state (pre-#22 dual-active baseline policy:
-        # when DesiredState == ENABLED, microphone is automatically desired)
-        self._microphone_desired: bool = (self._desired_state == DesiredState.ENABLED)
+        # Operating mode: PLAYBACK (default) or DICTATION
+        self._mode: str = "PLAYBACK"
+
+        # Microphone path state & desired state:
+        # Under Issue #43 Playback/Dictation baseline, microphone defaults to False
+        self._microphone_desired: bool = False
         self._microphone_path_state = PathState.IDLE
         self._microphone_child_pid: Optional[int] = None
         self._last_actionable_microphone_error: Optional[str] = None
+        self._current_dictation_session: Optional[str] = None
+        self._dictation_ack_event = threading.Event()
+        self._last_dictation_ack: Optional[dict] = None
         self._shutdown_requested = threading.Event()
         self._lock = threading.RLock()
 
@@ -231,7 +257,17 @@ class WindowsBridgeController:
             local_role=HostRole.WINDOWS,
             instance_id=f"win-{os.getpid()}-{int(time.time())}",
             on_peer_discovered=self._on_peer_discovered,
+            on_control_message=self._on_control_message,
         )
+
+    def _on_control_message(self, msg: dict, peer_ip: str) -> None:
+        """Handles incoming DICTATION_* control packets from elected peer."""
+        msg_type = msg.get("type")
+        if msg_type == "DICTATION_START_ACK":
+            session_id = msg.get("session_id")
+            if session_id and session_id == self._current_dictation_session:
+                self._last_dictation_ack = msg
+                self._dictation_ack_event.set()
 
     def _load_persisted_desired_state(self) -> DesiredState:
         if os.path.exists(self.state_file):
@@ -275,14 +311,18 @@ class WindowsBridgeController:
 
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
-            # Under pre-#22 dual-active baseline policy, enabling controller sets microphone desired
-            self._microphone_desired = True
+            # Default to PLAYBACK mode with microphone off
+            self._mode = "PLAYBACK"
+            self._microphone_desired = False
+            self._current_dictation_session = None
+            self._dictation_ack_event.clear()
             self._pack43_recovery_start_time = None
             self._pack43_recovery_attempts = 0
             self._last_pack43_attempt_time = 0.0
             self._controller_state = LifecycleState.STARTING
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
+
 
             # Start IPC server
             self._ipc_server.start()
@@ -322,11 +362,224 @@ class WindowsBridgeController:
             self.reconcile()
             return self._microphone_path_state == PathState.RUNNING
 
+    def start_dictation(self, timeout: float = 3.0) -> bool:
+        """Transitions from PLAYBACK to DICTATION mode following strict ordering:
+        PLAYBACK
+        ↓
+        suppress Windows → Mac speaker
+        ↓
+        resolve Pack43
+        ↓
+        START WINDOWS MICROPHONE RECEIVER
+        ↓
+        confirm receiver child is actually running/listening
+        ↓
+        generate fresh dictation session_id
+        ↓
+        send DICTATION_START(session_id) to Mac via authoritative 50100 control plane
+        ↓
+        Mac starts a fresh microphone sender
+        ↓
+        Mac replies DICTATION_START_ACK(session_id, success)
+        ↓
+        only after matching ACK:
+        mode = DICTATION
+        microphone = Active
+        """
+        import uuid
+
+        with self._lock:
+            if self._desired_state != DesiredState.ENABLED:
+                logger.warning("Cannot start dictation: controller is not ENABLED")
+                return False
+
+            if not self.discovery_service.peer_available or not self.discovery_service.peer_address:
+                logger.warning("Cannot start dictation: Mac peer is not available")
+                return False
+
+            # Duplicate Start Dictation check: idempotent
+            if (
+                self._mode == "DICTATION"
+                and self._microphone_child_pid is not None
+                and self.process_runner.is_running(self._microphone_child_pid)
+            ):
+                return True
+
+            # 1. Suppress Windows → Mac speaker
+            if self._speaker_child_pid is not None:
+                self.process_runner.stop_process(self._speaker_child_pid)
+                self._speaker_child_pid = None
+            self._speaker_path_state = PathState.STOPPED
+
+            # 2. Resolve Pack43
+            pack43_result = self.pack43_resolver.resolve_pack43()
+            if not pack43_result:
+                self._last_actionable_microphone_error = (
+                    "Standard VB-CABLE Pack43 not found or driver identity mismatch"
+                )
+                self._microphone_path_state = PathState.UNAVAILABLE
+                # Restore speaker and abort without opening Mac microphone
+                self._mode = "PLAYBACK"
+                self._microphone_desired = False
+                self._reconcile_speaker()
+                return False
+
+            # Ensure any prior microphone child is cleanly terminated
+            if self._microphone_child_pid is not None:
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+
+            # 3. START WINDOWS MICROPHONE RECEIVER
+            local_bind = self.discovery_service.local_bind_address
+            cmd = self.microphone_receiver_builder.build_receiver_command(
+                local_bind_ip=local_bind,
+                local_port=DEFAULT_MIC_RTP_PORT,
+                device_id=pack43_result.render_endpoint_id,
+            )
+
+            try:
+                pid = self.process_runner.start_process(cmd)
+                self._microphone_child_pid = pid
+            except Exception as exc:
+                self._last_actionable_microphone_error = f"Failed to start microphone receiver: {exc}"
+                self._microphone_path_state = PathState.FAILED
+                self._mode = "PLAYBACK"
+                self._microphone_desired = False
+                self._reconcile_speaker()
+                return False
+
+            # 4. Confirm receiver child is actually running/listening
+            if not self.process_runner.is_running(self._microphone_child_pid):
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+                self._last_actionable_microphone_error = "Microphone receiver child exited immediately"
+                self._microphone_path_state = PathState.FAILED
+                self._mode = "PLAYBACK"
+                self._microphone_desired = False
+                self._reconcile_speaker()
+                return False
+
+            # 5. Generate fresh dictation session_id
+            session_id = f"dict-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+            self._current_dictation_session = session_id
+            self._dictation_ack_event.clear()
+            self._last_dictation_ack = None
+
+            # 6. Send DICTATION_START(session_id) to Mac via authoritative 50100 control plane
+            target_ip = self.discovery_service.peer_address
+            start_msg = {
+                "version": 1,
+                "role": HostRole.WINDOWS.value,
+                "instance_id": self.discovery_service.instance_id,
+                "type": "DICTATION_START",
+                "session_id": session_id,
+            }
+            sent = self.discovery_service.send_control_message(target_ip, start_msg)
+            if not sent:
+                self._cleanup_failed_dictation(session_id, "Failed to send DICTATION_START to Mac")
+                return False
+
+        # 7. Wait for matching ACK from Mac
+        got_ack = self._dictation_ack_event.wait(timeout=timeout)
+
+        with self._lock:
+            if self._current_dictation_session != session_id:
+                logger.warning("Dictation session changed while waiting for ACK")
+                return False
+
+            ack = self._last_dictation_ack
+            if not got_ack or not ack or not ack.get("success"):
+                err_msg = ack.get("error") if ack else "Timeout waiting for Mac to start microphone"
+                self._cleanup_failed_dictation(session_id, err_msg)
+                return False
+
+            # 8. Only after matching ACK:
+            # mode = DICTATION
+            # microphone = Active
+            self._mode = "DICTATION"
+            self._microphone_desired = True
+            self._microphone_path_state = PathState.RUNNING
+            self._last_actionable_microphone_error = None
+            return True
+
+    def _cleanup_failed_dictation(self, session_id: str, error_msg: Optional[str] = None) -> None:
+        """Rolls back failed dictation: stops Windows receiver, ensures Mac mic stopped, restores speaker."""
+        if error_msg:
+            self._last_actionable_microphone_error = error_msg
+        if self._microphone_child_pid is not None:
+            self.process_runner.stop_process(self._microphone_child_pid)
+            self._microphone_child_pid = None
+
+        target_ip = self.discovery_service.peer_address
+        if target_ip and session_id:
+            stop_msg = {
+                "version": 1,
+                "role": HostRole.WINDOWS.value,
+                "instance_id": self.discovery_service.instance_id,
+                "type": "DICTATION_STOP",
+                "session_id": session_id,
+            }
+            self.discovery_service.send_control_message(target_ip, stop_msg)
+
+        self._microphone_desired = False
+        self._current_dictation_session = None
+        self._microphone_path_state = (
+            PathState.UNAVAILABLE
+            if self.pack43_resolver.is_cached_available is False
+            else PathState.IDLE
+        )
+        self._mode = "PLAYBACK"
+        self._reconcile_speaker()
+
+    def end_dictation(self) -> bool:
+        """Exits DICTATION mode and returns to PLAYBACK:
+        1. stop Mac microphone sender (via 50100 DICTATION_STOP)
+        2. stop Windows microphone receiver
+        3. microphone children must be 0
+        4. restore Windows → Mac speaker
+        5. return to PLAYBACK
+        """
+        with self._lock:
+            session_id = self._current_dictation_session
+            target_ip = self.discovery_service.peer_address
+
+            # 1. Stop Mac microphone sender
+            if target_ip and session_id:
+                stop_msg = {
+                    "version": 1,
+                    "role": HostRole.WINDOWS.value,
+                    "instance_id": self.discovery_service.instance_id,
+                    "type": "DICTATION_STOP",
+                    "session_id": session_id,
+                }
+                self.discovery_service.send_control_message(target_ip, stop_msg)
+
+            # 2. Stop Windows microphone receiver
+            if self._microphone_child_pid is not None:
+                self.process_runner.stop_process(self._microphone_child_pid)
+                self._microphone_child_pid = None
+
+            # 3. Microphone children must be 0
+            self._microphone_desired = False
+            self._current_dictation_session = None
+            self._microphone_path_state = (
+                PathState.READY if self.pack43_resolver.is_cached_available is True else PathState.IDLE
+            )
+
+            # 4. Restore Windows → Mac speaker & return to PLAYBACK
+            self._mode = "PLAYBACK"
+            self._reconcile_speaker()
+            return True
+
     def stop(self) -> bool:
+
         """Idempotently stops speaker and microphone pipelines and sets STOPPED_BY_USER."""
         with self._lock:
             self._desired_state = DesiredState.STOPPED_BY_USER
             self._persist_desired_state(DesiredState.STOPPED_BY_USER)
+            self._mode = "PLAYBACK"
+            self._current_dictation_session = None
+            self._dictation_ack_event.clear()
 
             # Stop owned speaker pipeline child
             if self._speaker_child_pid is not None:
@@ -359,7 +612,7 @@ class WindowsBridgeController:
         - Acquires singleton lock.
         - Starts local IPC server.
         - Loads persisted desired state.
-        - If ENABLED: restores microphone intent, starts discovery, and reconciles pipelines.
+        - If ENABLED: defaults to PLAYBACK (microphone False), starts discovery, and reconciles pipelines.
         - If STOPPED_BY_USER: leaves controller in STOPPED state with zero media children.
         """
         with self._lock:
@@ -379,8 +632,10 @@ class WindowsBridgeController:
             self._ipc_server.start()
 
             if self._desired_state == DesiredState.ENABLED:
-                # Under pre-#22 dual-active baseline policy, restored ENABLED host desires microphone
-                self._microphone_desired = True
+                self._mode = "PLAYBACK"
+                self._microphone_desired = False
+                self._current_dictation_session = None
+                self._dictation_ack_event.clear()
                 self._pack43_recovery_start_time = None
                 self._pack43_recovery_attempts = 0
                 self._last_pack43_attempt_time = 0.0
@@ -394,7 +649,10 @@ class WindowsBridgeController:
                     self._controller_state = LifecycleState.ERROR
                 self.reconcile()
             else:
+                self._mode = "PLAYBACK"
                 self._microphone_desired = False
+                self._current_dictation_session = None
+                self._dictation_ack_event.clear()
                 self._pack43_recovery_start_time = None
                 self._pack43_recovery_attempts = 0
                 self._last_pack43_attempt_time = 0.0
@@ -416,6 +674,10 @@ class WindowsBridgeController:
     def shutdown_host(self) -> None:
         """Shuts down host runtime, stopping owned children, IPC, and singleton WITHOUT mutating desired state."""
         with self._lock:
+            self._mode = "PLAYBACK"
+            self._current_dictation_session = None
+            self._dictation_ack_event.clear()
+
             # Stop owned speaker pipeline child
             if self._speaker_child_pid is not None:
                 self.process_runner.stop_process(self._speaker_child_pid)
@@ -425,9 +687,11 @@ class WindowsBridgeController:
             self._speaker_path_state = PathState.STOPPED
 
             # Stop owned microphone pipeline child
+            self._microphone_desired = False
             if self._microphone_child_pid is not None:
                 self.process_runner.stop_process(self._microphone_child_pid)
                 self._microphone_child_pid = None
+
             self._microphone_path_state = PathState.STOPPED
 
             # Stop discovery
@@ -500,7 +764,9 @@ class WindowsBridgeController:
                 microphone_port=DEFAULT_MIC_RTP_PORT,
                 pack43_available=pack43_avail,
                 last_actionable_microphone_error=self._last_actionable_microphone_error,
+                mode=self._mode,
             )
+
 
     def reconcile(self) -> None:
         """Idempotently brings actual state toward desired state."""
@@ -575,6 +841,14 @@ class WindowsBridgeController:
 
     def _reconcile_speaker(self) -> None:
         """Idempotently reconciles the Windows speaker sender path."""
+        # Suppress speaker when in DICTATION mode
+        if self._mode == "DICTATION":
+            if self._speaker_child_pid is not None:
+                self.process_runner.stop_process(self._speaker_child_pid)
+                self._speaker_child_pid = None
+            self._speaker_path_state = PathState.STOPPED
+            return
+
         # Resolve playback endpoint for speaker
         endpoint_id = self.device_resolver.resolve_default_playback_endpoint_id()
         if not endpoint_id:

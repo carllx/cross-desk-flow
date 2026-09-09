@@ -119,8 +119,11 @@ class TestProductShellAppIPC(unittest.TestCase):
 
     def setUp(self):
         import tkinter as tk
-        self.root = tk.Tk()
-        self.root.withdraw()  # Hide window during test execution
+        try:
+            self.root = tk.Tk()
+            self.root.withdraw()  # Hide window during test execution
+        except Exception as e:
+            self.skipTest(f"Tkinter display not available: {e}")
         self.commands_sent = []
         self.mock_status: Optional[Dict[str, Any]] = {
             "controller_state": "ACTIVE",
@@ -131,7 +134,8 @@ class TestProductShellAppIPC(unittest.TestCase):
         }
 
     def tearDown(self):
-        self.root.destroy()
+        if hasattr(self, "root") and self.root:
+            self.root.destroy()
 
     def mock_ipc(self, command: str) -> Optional[Dict[str, Any]]:
         self.commands_sent.append(command)
