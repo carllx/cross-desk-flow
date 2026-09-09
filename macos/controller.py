@@ -40,6 +40,8 @@ from .device_resolver import MacCoreAudioDeviceResolver, check_microphone_author
 from .microphone_sender import MicrophoneSenderBuilder
 from .process_runner import MacOwnedProcessRunner
 from .speaker_receiver import SpeakerReceiverBuilder
+from .dictation_responder import MacDictationResponder
+from .local_control_server import LocalControlServer
 
 logger = logging.getLogger(__name__)
 
@@ -86,108 +88,6 @@ class SingleInstanceLock:
     @property
     def is_held(self) -> bool:
         return self._held
-
-
-class LocalControlServer:
-    """TCP server running on 127.0.0.1:50106 to serve CLI requests on macOS."""
-
-    def __init__(self, controller: "MacBridgeController", port: int = DEFAULT_LOCAL_IPC_PORT):
-        self.controller = controller
-        self.port = port
-        self._server_sock: Optional[socket.socket] = None
-        self._thread: Optional[threading.Thread] = None
-        self._running = False
-
-    def start(self) -> bool:
-        if self._running:
-            return True
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", self.port))
-            s.listen(5)
-            self._server_sock = s
-            self._running = True
-            self._thread = threading.Thread(
-                target=self._serve_loop, daemon=True, name="MacLocalControlServer"
-            )
-            self._thread.start()
-            return True
-        except Exception as exc:
-            logger.debug("Failed to start MacLocalControlServer on port %d: %s", self.port, exc)
-            return False
-
-    def stop(self) -> None:
-        self._running = False
-        if self._server_sock:
-            try:
-                self._server_sock.close()
-            except Exception:
-                pass
-            self._server_sock = None
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._thread = None
-
-    def _serve_loop(self) -> None:
-        while self._running and self._server_sock:
-            try:
-                client, _ = self._server_sock.accept()
-            except (OSError, socket.error):
-                break
-
-            try:
-                data = client.recv(4096)
-                if not data:
-                    client.close()
-                    continue
-                req = json.loads(data.decode("utf-8"))
-                cmd = req.get("command")
-
-                res = {}
-                if cmd == "start":
-                    success = self.controller.start()
-                    res = {
-                        "success": success,
-                        "desired_state": self.controller.get_status().desired_state,
-                    }
-                elif cmd == "stop":
-                    success = self.controller.stop()
-                    res = {
-                        "success": success,
-                        "desired_state": self.controller.get_status().desired_state,
-                    }
-                elif cmd == "reconcile":
-                    self.controller.reconcile()
-                    res = {"success": True}
-                elif cmd == "status":
-                    res = self.controller.get_status().to_dict()
-                elif cmd == "mic-enable":
-                    success = self.controller.set_microphone_enabled(True)
-                    res = {
-                        "success": success,
-                        "microphone_path_state": self.controller.get_status().microphone_path_state,
-                    }
-                elif cmd == "mic-disable":
-                    success = self.controller.set_microphone_enabled(False)
-                    res = {
-                        "success": success,
-                        "microphone_path_state": self.controller.get_status().microphone_path_state,
-                    }
-                else:
-                    res = {"error": f"Unknown command {cmd}"}
-
-                client.sendall(json.dumps(res).encode("utf-8"))
-            except Exception as exc:
-                try:
-                    client.sendall(json.dumps({"error": str(exc)}).encode("utf-8"))
-                except Exception:
-                    pass
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
 
 
 class MacBridgeController:
@@ -240,7 +140,7 @@ class MacBridgeController:
         self._microphone_path_state = PathState.IDLE
         self._microphone_child_pid: Optional[int] = None
         self._last_actionable_microphone_error: Optional[str] = None
-        self._current_dictation_session: Optional[str] = None
+        self.dictation_responder = MacDictationResponder(self)
         self._lock = threading.RLock()
 
         # Wire discovery service for HostRole.MACOS
@@ -252,75 +152,15 @@ class MacBridgeController:
         )
 
     def _on_control_message(self, msg: dict, peer_ip: str) -> None:
-        """Handles incoming DICTATION_* control packets from verified elected peer."""
-        msg_type = msg.get("type")
-        session_id = msg.get("session_id")
-        if not session_id:
-            return
+        self.dictation_responder.handle_control_message(msg, peer_ip)
 
-        with self._lock:
-            if msg_type == "DICTATION_START":
-                # Reject if stopped by user
-                if self._desired_state == DesiredState.STOPPED_BY_USER:
-                    self.discovery_service.send_control_message(peer_ip, {
-                        "version": CONTROL_PROTOCOL_VERSION,
-                        "role": HostRole.MACOS.value,
-                        "instance_id": self.discovery_service.instance_id,
-                        "type": "DICTATION_START_ACK",
-                        "session_id": session_id,
-                        "success": False,
-                        "error": "macOS host is stopped by user",
-                    })
-                    return
+    @property
+    def _current_dictation_session(self) -> Optional[str]:
+        return self.dictation_responder.current_dictation_session
 
-                # If duplicate start with same session_id and mic already running: idempotent
-                if (
-                    self._current_dictation_session == session_id
-                    and self._microphone_child_pid is not None
-                    and self.process_runner.is_running(self._microphone_child_pid)
-                ):
-                    self.discovery_service.send_control_message(peer_ip, {
-                        "version": CONTROL_PROTOCOL_VERSION,
-                        "role": HostRole.MACOS.value,
-                        "instance_id": self.discovery_service.instance_id,
-                        "type": "DICTATION_START_ACK",
-                        "session_id": session_id,
-                        "success": True,
-                        "state": PathState.RUNNING.value,
-                    })
-                    return
-
-                # If new session: ensure any prior microphone child is cleanly terminated
-                if self._microphone_child_pid is not None:
-                    self._stop_child("microphone")
-                    self._microphone_child_pid = None
-
-                self._current_dictation_session = session_id
-                ok = self.set_microphone_enabled(True)
-                status = self.get_status()
-                self.discovery_service.send_control_message(peer_ip, {
-                    "version": CONTROL_PROTOCOL_VERSION,
-                    "role": HostRole.MACOS.value,
-                    "instance_id": self.discovery_service.instance_id,
-                    "type": "DICTATION_START_ACK",
-                    "session_id": session_id,
-                    "success": ok,
-                    "state": status.microphone_path_state,
-                    "error": status.last_actionable_microphone_error,
-                })
-
-            elif msg_type == "DICTATION_STOP":
-                self.set_microphone_enabled(False)
-                self._current_dictation_session = None
-                self.discovery_service.send_control_message(peer_ip, {
-                    "version": CONTROL_PROTOCOL_VERSION,
-                    "role": HostRole.MACOS.value,
-                    "instance_id": self.discovery_service.instance_id,
-                    "type": "DICTATION_STOP_ACK",
-                    "session_id": session_id,
-                    "success": True,
-                })
-
+    @_current_dictation_session.setter
+    def _current_dictation_session(self, val: Optional[str]) -> None:
+        self.dictation_responder.current_dictation_session = val
 
     def _load_ownership_journal(self) -> Tuple[Optional[dict], Optional[str]]:
         """Loads ownership journal.

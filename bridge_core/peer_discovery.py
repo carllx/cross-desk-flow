@@ -27,6 +27,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from bridge_core.dictation_control import DictationControlMixin
+from bridge_core.interface_classifier import InterfaceClassifier, InterfaceMedium
 from bridge_core.contract import (
     CONTROL_PROTOCOL_VERSION,
     DEFAULT_CONTROL_PORT,
@@ -40,156 +42,6 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_HEARTBEAT_INTERVAL = 4.0
-
-
-class InterfaceMedium(str, enum.Enum):
-    """Network interface medium classification."""
-
-    WIRED_ETHERNET = "WIRED_ETHERNET"
-    WIFI = "WIFI"
-    OTHER = "OTHER"
-
-
-class InterfaceClassifier:
-    """Seam for classifying local IP addresses by underlying network medium."""
-
-    def __init__(self) -> None:
-        self._positive_cache: Dict[str, InterfaceMedium] = {}
-
-    def _resolve_powershell_cmd(self) -> Optional[str]:
-        """Resolves PowerShell executable via SystemRoot, pwsh, or PATH."""
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
-        built_in = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-        if os.path.isfile(built_in):
-            return built_in
-        pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
-        if pwsh:
-            return pwsh
-        ps = shutil.which("powershell.exe") or shutil.which("powershell")
-        if ps:
-            return ps
-        return None
-
-    def classify_interface(self, ip_str: str) -> InterfaceMedium:
-        """Classifies the interface owning ip_str into InterfaceMedium.
-        
-        Uses Darwin (system_profiler / networksetup) or Windows (PowerShell Get-NetAdapter) OS metadata.
-        Falls back safely to InterfaceMedium.OTHER if not explicitly confirmed as Ethernet or Wi-Fi.
-        """
-        if not ip_str or ip_str in ("0.0.0.0", "127.0.0.1"):
-            return InterfaceMedium.OTHER
-
-        cached = self._positive_cache.get(ip_str)
-        if cached is not None:
-            return cached
-
-        classified = InterfaceMedium.OTHER
-        try:
-            sys_name = platform.system()
-            if sys_name == "Windows":
-                classified = self._classify_windows(ip_str)
-            elif sys_name == "Darwin":
-                import psutil
-                target_iface = None
-                for iface_name, addrs in psutil.net_if_addrs().items():
-                    for addr in addrs:
-                        if addr.family == socket.AF_INET and addr.address == ip_str:
-                            target_iface = iface_name
-                            break
-                    if target_iface:
-                        break
-
-                if target_iface:
-                    classified = self._classify_darwin(target_iface)
-            else:
-                classified = InterfaceMedium.OTHER
-        except Exception as exc:
-            logger.debug("Interface classification failed for %s: %s", ip_str, exc)
-            classified = InterfaceMedium.OTHER
-
-        if classified in (InterfaceMedium.WIRED_ETHERNET, InterfaceMedium.WIFI):
-            self._positive_cache[ip_str] = classified
-
-        return classified
-
-    def _classify_darwin(self, iface_name: str) -> InterfaceMedium:
-        """Classifies macOS interface using system_profiler SPNetworkDataType and networksetup."""
-        try:
-            # 1. Primary: system_profiler SPNetworkDataType exposes authoritative BSD Device Name -> Type
-            cmd = ["system_profiler", "SPNetworkDataType"]
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3.0)
-            current_type = ""
-            current_dev = ""
-            for line in out.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("Type:"):
-                    current_type = stripped.split(":", 1)[1].strip()
-                elif stripped.startswith("BSD Device Name:"):
-                    current_dev = stripped.split(":", 1)[1].strip()
-                    if current_dev == iface_name:
-                        type_lower = current_type.lower()
-                        if "ethernet" in type_lower:
-                            return InterfaceMedium.WIRED_ETHERNET
-                        if "airport" in type_lower or "wi-fi" in type_lower or "wireless" in type_lower:
-                            return InterfaceMedium.WIFI
-                        return InterfaceMedium.OTHER
-        except Exception:
-            pass
-
-        try:
-            # 2. Secondary fallback: networksetup -listallhardwareports
-            cmd = ["networksetup", "-listallhardwareports"]
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=2.0)
-            current_port = ""
-            for line in out.splitlines():
-                line = line.strip()
-                if line.startswith("Hardware Port:"):
-                    current_port = line.split(":", 1)[1].strip()
-                elif line.startswith("Device:"):
-                    dev = line.split(":", 1)[1].strip()
-                    if dev == iface_name:
-                        port_lower = current_port.lower()
-                        if "wi-fi" in port_lower or "airport" in port_lower:
-                            return InterfaceMedium.WIFI
-                        if "ethernet" in port_lower or "lan" in port_lower or "thunderbolt bridge" in port_lower:
-                            return InterfaceMedium.WIRED_ETHERNET
-                        return InterfaceMedium.OTHER
-        except Exception:
-            pass
-
-        return InterfaceMedium.OTHER
-
-    def _classify_windows(self, ip_str: str) -> InterfaceMedium:
-        """Classifies Windows interface using PowerShell Get-NetAdapter PhysicalMediaType by IP."""
-        try:
-            ps_exe = self._resolve_powershell_cmd()
-            if not ps_exe:
-                return InterfaceMedium.OTHER
-
-            cmd = [
-                ps_exe,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                f"(Get-NetAdapter -InterfaceIndex (Get-NetIPAddress -IPAddress {ip_str} -ErrorAction SilentlyContinue).InterfaceIndex -ErrorAction SilentlyContinue).PhysicalMediaType",
-            ]
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            out = subprocess.check_output(
-                cmd,
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=15.0,
-                creationflags=creationflags,
-            ).strip()
-            out_lower = out.lower()
-            if "802.3" in out_lower or "ethernet" in out_lower:
-                return InterfaceMedium.WIRED_ETHERNET
-            if "native 802.11" in out_lower or "wireless" in out_lower or "wi-fi" in out_lower:
-                return InterfaceMedium.WIFI
-        except Exception:
-            pass
-        return InterfaceMedium.OTHER
-
 
 
 def is_eligible_onlink_ipv4(ip_str: str, netmask_str: Optional[str] = None) -> bool:
@@ -294,7 +146,7 @@ class RouteResolver:
             return "0.0.0.0"
 
 
-class PeerDiscoveryService:
+class PeerDiscoveryService(DictationControlMixin):
     """Manages control plane discovery, route resolution, and ambiguity detection."""
 
     def __init__(
@@ -548,26 +400,6 @@ class PeerDiscoveryService:
                 if sock:
                     sock.close()
 
-    def send_control_message(self, peer_ip: str, message: dict) -> bool:
-        """Sends a directed DICTATION control packet to elected peer on port 50100."""
-        with self._lock:
-            if not self._running:
-                return False
-            if peer_ip != self._peer_address:
-                logger.warning("Cannot send control message: %s does not match elected peer %s", peer_ip, self._peer_address)
-                return False
-            sock = self._listener_sock
-            if not sock:
-                return False
-
-        data = json.dumps(message).encode("utf-8")
-        try:
-            sock.sendto(data, (peer_ip, self.control_port))
-            return True
-        except Exception as exc:
-            logger.warning("Failed to send control message to %s: %s", peer_ip, exc)
-            return False
-
     def handle_peer_message(self, msg: Any, peer_ip: str) -> None:
         """Processes an incoming peer packet (used by both _listen_loop and automated tests)."""
         if isinstance(msg, (bytes, bytearray)):
@@ -583,32 +415,10 @@ class PeerDiscoveryService:
         if version != CONTROL_PROTOCOL_VERSION or msg_role != self.target_role.value:
             return
 
-        msg_type = msg.get("type", "")
-        if isinstance(msg_type, str) and msg_type.startswith("DICTATION_"):
-            # 50100 control/discovery separation:
-            # DICTATION control packets are branched BEFORE discovery logic.
-            # They MUST NOT update _known_responders, _peer_candidates, route election,
-            # discovery liveness, or trigger discovery ACKs.
-            with self._lock:
-                if self._is_ambiguous or not self._peer_address or not self._peer_instance_id:
-                    logger.debug("Dropping DICTATION message: peer ambiguous or not yet elected")
-                    return
-                # Peer validation: verify source IP corresponds to current elected peer address
-                if peer_ip != self._peer_address:
-                    logger.warning("Dropping DICTATION message from non-elected IP %s (elected %s)", peer_ip, self._peer_address)
-                    return
-                # Peer validation: verify sender instance_id matches selected peer_instance_id
-                sender_inst = msg.get("instance_id")
-                if sender_inst != self._peer_instance_id:
-                    logger.warning("Dropping DICTATION message from unverified instance %s (elected %s)", sender_inst, self._peer_instance_id)
-                    return
-
-            if self.on_control_message:
-                try:
-                    self.on_control_message(msg, peer_ip)
-                except Exception as exc:
-                    logger.warning("Error in on_control_message callback: %s", exc)
+        if self.handle_dictation_message(msg, peer_ip):
             return
+
+
 
 
         peer_inst = msg.get("instance_id", "")
