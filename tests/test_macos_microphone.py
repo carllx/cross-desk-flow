@@ -15,6 +15,7 @@ Verifies:
 - Status reflection is strictly read-only
 """
 
+import json
 import os
 import tempfile
 import time
@@ -221,8 +222,8 @@ def test_sender_canonical_rtp_command_format():
 # Test Suite 3: Lifecycle & Controller Integration
 # ---------------------------------------------------------
 
-def test_microphone_not_started_automatically_on_peer_online(temp_state_file):
-    """Microphone must NOT start automatically when controller starts or peer is online."""
+def test_microphone_auto_starts_on_enabled_with_peer(temp_state_file):
+    """Under pre-#22 dual-active policy, microphone automatically starts when controller starts and peer is online."""
     runner = FakeProcessRunner()
     resolver = FakeDeviceResolver()
     disc = FakeDiscoveryService()
@@ -239,8 +240,101 @@ def test_microphone_not_started_automatically_on_peer_online(temp_state_file):
     st = ctrl.get_status()
     assert st.controller_state == LifecycleState.ACTIVE.value
     assert st.speaker_path_state == PathState.RUNNING.value
-    assert st.microphone_path_state == PathState.IDLE.value
+    assert st.microphone_path_state == PathState.RUNNING.value
+    assert st.owned_children_count == 2
+    assert ctrl._microphone_child_pid is not None
+    ctrl.shutdown()
+
+
+def test_microphone_not_started_when_stopped_by_user(temp_state_file):
+    """When persisted desired state is STOPPED_BY_USER, start_host leaves zero media children."""
+    runner = FakeProcessRunner()
+    resolver = FakeDeviceResolver()
+    disc = FakeDiscoveryService()
+    # Write STOPPED_BY_USER to state file
+    with open(temp_state_file, "w") as f:
+        json.dump({"desired_state": DesiredState.STOPPED_BY_USER.value}, f)
+
+    ctrl = MacBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=resolver,
+        discovery_service=disc,
+        lock_port=50312,
+        ipc_port=50313,
+    )
+    assert ctrl.start_host() is True
+
+    st = ctrl.get_status()
+    assert st.controller_state == LifecycleState.STOPPED.value
+    assert st.speaker_path_state == PathState.STOPPED.value
+    assert st.microphone_path_state == PathState.STOPPED.value
+    assert st.owned_children_count == 0
+    assert ctrl._microphone_child_pid is None
+    assert ctrl._speaker_child_pid is None
+    ctrl.shutdown()
+
+
+def test_reboot_persisted_enabled_restores_microphone_intent(temp_state_file):
+    """When persisted desired state is ENABLED, start_host automatically restores microphone desired intent and runs mic."""
+    runner = FakeProcessRunner()
+    resolver = FakeDeviceResolver()
+    disc = FakeDiscoveryService()
+    # Write ENABLED to state file as left by previous session / reboot
+    with open(temp_state_file, "w") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    ctrl = MacBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=resolver,
+        discovery_service=disc,
+        lock_port=50350,
+        ipc_port=50351,
+    )
+    assert ctrl.start_host() is True
+    assert ctrl._microphone_desired is True
+
+    st = ctrl.get_status()
+    assert st.desired_state == DesiredState.ENABLED.value
+    assert st.controller_state == LifecycleState.ACTIVE.value
+    assert st.speaker_path_state == PathState.RUNNING.value
+    assert st.microphone_path_state == PathState.RUNNING.value
+    assert st.owned_children_count == 2
+    assert ctrl._speaker_child_pid is not None
+    assert ctrl._microphone_child_pid is not None
+    ctrl.shutdown()
+
+
+def test_reboot_persisted_enabled_with_mic_permission_denied_fails_closed(temp_state_file):
+    """When persisted desired state is ENABLED but mic permission is Denied, microphone fails closed while speaker remains ACTIVE."""
+    runner = FakeProcessRunner()
+    resolver = FakeDeviceResolver()
+    disc = FakeDiscoveryService()
+    # Write ENABLED to state file
+    with open(temp_state_file, "w") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    # Mic permission returns 2 (Denied)
+    ctrl = MacBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=resolver,
+        discovery_service=disc,
+        mic_permission_probe=lambda: 2,
+        lock_port=50352,
+        ipc_port=50353,
+    )
+    assert ctrl.start_host() is True
+    assert ctrl._microphone_desired is True
+
+    st = ctrl.get_status()
+    assert st.desired_state == DesiredState.ENABLED.value
+    assert st.speaker_path_state == PathState.RUNNING.value
+    assert st.microphone_path_state == PathState.FAILED.value
+    assert "Microphone permission denied" in (st.last_actionable_microphone_error or "")
     assert st.owned_children_count == 1
+    assert ctrl._speaker_child_pid is not None
     assert ctrl._microphone_child_pid is None
     ctrl.shutdown()
 
@@ -461,8 +555,13 @@ def test_speaker_receiver_unaffected_by_microphone_failure(temp_state_file):
     ctrl.start()
     assert ctrl.get_status().speaker_path_state == PathState.RUNNING.value
     spk_pid = ctrl._speaker_child_pid
+    # Under pre-#22 dual-active, mic started running on ctrl.start()
+    assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
+    # Disable first
+    ctrl.set_microphone_enabled(False)
+    assert ctrl.get_status().microphone_path_state == PathState.STOPPED.value
 
-    # Now simulate mic resolution failure
+    # Now simulate mic resolution failure and re-enable
     resolver.fail_mic = True
     ok = ctrl.set_microphone_enabled(True)
     assert ok is False
