@@ -1315,16 +1315,21 @@ def test_microphone_journal_start_failure_cleanup_success(isolated_env, monkeypa
     ctrl.discovery_service = FakeDiscovery()
     assert ctrl.start_host()
 
+    # Under pre-#22 dual-active policy, ctrl.start() sets _microphone_desired=True and immediately reconciles.
+    # Failure injection must be installed before ctrl.start() and target role=="microphone" specifically.
+    orig_record = ctrl._record_child_started
+    def selective_record(role, pid, cmd, port):
+        if role == "microphone":
+            return False
+        return orig_record(role, pid, cmd, port)
+
+    monkeypatch.setattr(ctrl, "_record_child_started", selective_record)
+
     # Enable controller
     ctrl.start()
 
-    # Set microphone desired
-    ctrl._microphone_desired = True
-    monkeypatch.setattr(ctrl, "_record_child_started", lambda role, pid, cmd, port: False)
-
-    ctrl.reconcile()
-
     status = ctrl.get_status()
+    assert status.speaker_path_state == "RUNNING"
     assert status.microphone_path_state == "FAILED"
     assert ctrl._microphone_child_pid is None
     assert "Failed to atomically record microphone child in ownership journal" in (status.last_actionable_microphone_error or "")
@@ -1361,14 +1366,26 @@ def test_microphone_journal_start_failure_cleanup_failure(isolated_env, monkeypa
     ctrl.discovery_service = FakeDiscovery()
     assert ctrl.start_host()
 
-    ctrl.start()
-    ctrl._microphone_desired = True
-    # Simulate journal start recording failure
-    monkeypatch.setattr(ctrl, "_record_child_started", lambda role, pid, cmd, port: False)
-    # Simulate cleanup failure: stop_process returns False (cannot confirm death)
-    monkeypatch.setattr(ctrl.process_runner, "stop_process", lambda pid: False)
+    # Under pre-#22 dual-active policy, ctrl.start() starts both speaker and microphone concurrently.
+    # Failure injection must be installed before ctrl.start() and target role=="microphone".
+    orig_record = ctrl._record_child_started
+    def selective_record(role, pid, cmd, port):
+        if role == "microphone":
+            return False
+        return orig_record(role, pid, cmd, port)
 
-    ctrl.reconcile()
+    monkeypatch.setattr(ctrl, "_record_child_started", selective_record)
+
+    # Simulate cleanup failure specifically for the spawned microphone child PID
+    orig_stop = ctrl.process_runner.stop_process
+    def selective_stop(pid):
+        if pid == ctrl._microphone_child_pid:
+            return False
+        return orig_stop(pid)
+
+    monkeypatch.setattr(ctrl.process_runner, "stop_process", selective_stop)
+
+    ctrl.start()
 
     status = ctrl.get_status()
     assert status.microphone_path_state == "FAILED"
@@ -1378,11 +1395,15 @@ def test_microphone_journal_start_failure_cleanup_failure(isolated_env, monkeypa
     assert "cleanup could not be confirmed" in (status.last_actionable_microphone_error or "")
 
     # Cleanup the actual spawned process
-    if ctrl._microphone_child_pid and psutil.pid_exists(ctrl._microphone_child_pid):
+    mic_pid = ctrl._microphone_child_pid
+    if mic_pid and psutil.pid_exists(mic_pid):
         try:
-            os.kill(ctrl._microphone_child_pid, signal.SIGKILL)
+            os.kill(mic_pid, signal.SIGKILL)
         except Exception:
             pass
+
+    # Restore normal stop_process so ctrl.shutdown() can cleanly stop the speaker receiver
+    monkeypatch.setattr(ctrl.process_runner, "stop_process", orig_stop)
 
     ctrl.shutdown()
 
