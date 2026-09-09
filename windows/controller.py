@@ -43,6 +43,10 @@ DEFAULT_STATE_FILE = os.path.join(
     os.environ.get("LOCALAPPDATA", "."), "desk-audio-bridge", "controller_state.json"
 )
 
+STARTUP_PACK43_MAX_ATTEMPTS: int = 3
+STARTUP_PACK43_WINDOW_SEC: float = 30.0
+STARTUP_PACK43_RETRY_INTERVAL_SEC: float = 2.0
+
 
 class SingleInstanceLock:
     """Guarantees controller singleton execution per machine via local socket bind."""
@@ -208,13 +212,19 @@ class WindowsBridgeController:
         self._active_peer_address: Optional[str] = None
         self._active_local_bind: Optional[str] = None
 
-        # Microphone path state & desired state
-        self._microphone_desired: bool = False
+        # Microphone path state & desired state (pre-#22 dual-active baseline policy:
+        # when DesiredState == ENABLED, microphone is automatically desired)
+        self._microphone_desired: bool = (self._desired_state == DesiredState.ENABLED)
         self._microphone_path_state = PathState.IDLE
         self._microphone_child_pid: Optional[int] = None
         self._last_actionable_microphone_error: Optional[str] = None
         self._shutdown_requested = threading.Event()
         self._lock = threading.RLock()
+
+        # Bounded startup Pack43 recovery tracking
+        self._pack43_recovery_start_time: Optional[float] = None
+        self._pack43_recovery_attempts: int = 0
+        self._last_pack43_attempt_time: float = 0.0
 
         # Wire discovery service
         self.discovery_service = discovery_service or PeerDiscoveryService(
@@ -265,6 +275,11 @@ class WindowsBridgeController:
 
             self._desired_state = DesiredState.ENABLED
             self._persist_desired_state(DesiredState.ENABLED)
+            # Under pre-#22 dual-active baseline policy, enabling controller sets microphone desired
+            self._microphone_desired = True
+            self._pack43_recovery_start_time = None
+            self._pack43_recovery_attempts = 0
+            self._last_pack43_attempt_time = 0.0
             self._controller_state = LifecycleState.STARTING
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
@@ -292,11 +307,14 @@ class WindowsBridgeController:
                     self._microphone_child_pid = None
                 self._microphone_path_state = PathState.STOPPED
                 self._last_actionable_microphone_error = None
+                self._pack43_recovery_start_time = None
+                self._pack43_recovery_attempts = 0
                 return True
 
-            # When enabling microphone, if Pack43 is not already confirmed available,
-            # invalidate any negative or stale cache so that a transient previous failure
-            # does not block fresh re-probing on explicit user request.
+            # When enabling microphone, arm recovery budget and invalidate stale/negative cache
+            self._pack43_recovery_start_time = None
+            self._pack43_recovery_attempts = 0
+            self._last_pack43_attempt_time = 0.0
             if self.pack43_resolver.is_cached_available is not True:
                 self.pack43_resolver.invalidate_cache()
 
@@ -318,7 +336,11 @@ class WindowsBridgeController:
             self._active_local_bind = None
             self._speaker_path_state = PathState.STOPPED
 
-            # Stop owned microphone pipeline child
+            # Stop owned microphone pipeline child and reset microphone intent
+            self._microphone_desired = False
+            self._pack43_recovery_start_time = None
+            self._pack43_recovery_attempts = 0
+            self._last_pack43_attempt_time = 0.0
             if self._microphone_child_pid is not None:
                 self.process_runner.stop_process(self._microphone_child_pid)
                 self._microphone_child_pid = None
@@ -337,7 +359,7 @@ class WindowsBridgeController:
         - Acquires singleton lock.
         - Starts local IPC server.
         - Loads persisted desired state.
-        - If ENABLED: starts discovery and reconciles pipelines.
+        - If ENABLED: restores microphone intent, starts discovery, and reconciles pipelines.
         - If STOPPED_BY_USER: leaves controller in STOPPED state with zero media children.
         """
         with self._lock:
@@ -357,6 +379,11 @@ class WindowsBridgeController:
             self._ipc_server.start()
 
             if self._desired_state == DesiredState.ENABLED:
+                # Under pre-#22 dual-active baseline policy, restored ENABLED host desires microphone
+                self._microphone_desired = True
+                self._pack43_recovery_start_time = None
+                self._pack43_recovery_attempts = 0
+                self._last_pack43_attempt_time = 0.0
                 self._controller_state = LifecycleState.STARTING
                 self._speaker_path_state = PathState.IDLE
                 self._last_actionable_error = None
@@ -367,6 +394,10 @@ class WindowsBridgeController:
                     self._controller_state = LifecycleState.ERROR
                 self.reconcile()
             else:
+                self._microphone_desired = False
+                self._pack43_recovery_start_time = None
+                self._pack43_recovery_attempts = 0
+                self._last_pack43_attempt_time = 0.0
                 self._controller_state = LifecycleState.STOPPED
                 self._speaker_path_state = PathState.STOPPED
                 self._microphone_path_state = PathState.STOPPED
@@ -611,12 +642,50 @@ class WindowsBridgeController:
             self._microphone_path_state = PathState.FAILED
             return
 
+        # Bounded startup Pack43 recovery probe logic:
+        # If Pack43 is cached unavailable, check whether we are still within the startup recovery budget.
+        # If within budget and retry interval has elapsed, invalidate the negative cache to allow
+        # another probe attempt during startup. Once budget is exhausted, do not retry (no steady-state hammering).
+        now = time.time()
+        if self.pack43_resolver.is_cached_available is False:
+            can_retry = False
+            if self._pack43_recovery_start_time is not None:
+                within_window = (now - self._pack43_recovery_start_time) < STARTUP_PACK43_WINDOW_SEC
+                within_attempts = self._pack43_recovery_attempts < STARTUP_PACK43_MAX_ATTEMPTS
+                interval_elapsed = (now - self._last_pack43_attempt_time) >= STARTUP_PACK43_RETRY_INTERVAL_SEC
+                if within_window and within_attempts and interval_elapsed:
+                    can_retry = True
+
+            if can_retry:
+                logger.info(
+                    "Retrying transient Pack43 startup resolution (attempt %d/%d)",
+                    self._pack43_recovery_attempts + 1,
+                    STARTUP_PACK43_MAX_ATTEMPTS,
+                )
+                self._pack43_recovery_attempts += 1
+                self._last_pack43_attempt_time = now
+                self.pack43_resolver.invalidate_cache()
+            else:
+                # Budget exhausted or interval not elapsed: fail-closed without WMI enumeration
+                self._last_actionable_microphone_error = "Standard VB-CABLE Pack43 not found or driver identity mismatch"
+                self._microphone_path_state = PathState.UNAVAILABLE
+                return
+
         # Resolve Pack43 render endpoint
         pack43_result = self.pack43_resolver.resolve_pack43()
         if not pack43_result:
+            # First negative result: initialize startup recovery budget if not already tracking
+            if self._pack43_recovery_start_time is None:
+                self._pack43_recovery_start_time = now
+                self._pack43_recovery_attempts = 1
+                self._last_pack43_attempt_time = now
             self._last_actionable_microphone_error = "Standard VB-CABLE Pack43 not found or driver identity mismatch"
             self._microphone_path_state = PathState.UNAVAILABLE
             return
+
+        # Resolution succeeded: reset startup recovery tracking
+        self._pack43_recovery_start_time = None
+        self._pack43_recovery_attempts = 0
 
         # Build receiver command
         local_bind = self.discovery_service.local_bind_address

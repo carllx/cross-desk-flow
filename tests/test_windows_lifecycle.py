@@ -125,9 +125,18 @@ class MockDiscoveryService:
 
 
 class MockPack43Resolver:
+    def __init__(self):
+        self.cached = False
+
     @property
     def is_cached_available(self):
-        return False
+        return self.cached
+
+    def resolve_pack43(self, force_refresh: bool = False):
+        return None
+
+    def invalidate_cache(self):
+        pass
 
 
 def test_start_host_preserves_persisted_enabled(temp_state_file):
@@ -240,6 +249,92 @@ def test_explicit_start_and_stop_persist_intent(temp_state_file):
         assert ctrl.get_status().desired_state == DesiredState.STOPPED_BY_USER.value
         with open(temp_state_file, "r", encoding="utf-8") as f:
             assert json.load(f)["desired_state"] == DesiredState.STOPPED_BY_USER.value
+
+        ctrl.shutdown_host()
+
+
+def test_start_host_enabled_restores_microphone_intent_and_runs_both_media_children(temp_state_file):
+    """Under pre-#22 dual-active policy, start_host on persisted ENABLED restores microphone intent
+
+    and runs both speaker and microphone media children if Pack43 is available.
+    """
+    with open(temp_state_file, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    class AvailablePack43Resolver:
+        @property
+        def is_cached_available(self):
+            return True
+
+        def resolve_pack43(self, force_refresh: bool = False):
+            from windows.pack43_resolver import Pack43ResolutionResult
+            return Pack43ResolutionResult(
+                render_endpoint_id="{mock-pack43-render}",
+                capture_endpoint_id="{mock-pack43-capture}",
+                driver_version="1.0.3.5",
+            )
+
+        def invalidate_cache(self):
+            pass
+
+    class MockMicReceiverBuilder:
+        def is_gstreamer_available(self):
+            return True
+
+        def build_receiver_command(self, **kwargs):
+            return ["mock-gst-mic-receiver"]
+
+    runner = MockProcessRunner()
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        device_resolver=MockDeviceResolver(),
+        process_runner=runner,
+        pipeline_builder=MockPipelineBuilder(),
+        discovery_service=MockDiscoveryService(),
+        pack43_resolver=AvailablePack43Resolver(),
+        microphone_receiver_builder=MockMicReceiverBuilder(),
+        lock_port=52113,
+        ipc_port=52114,
+    )
+    with patch("windows.controller.check_runtime_dependencies", return_value=(True, "")):
+        ok = ctrl.start_host()
+        assert ok is True
+        st = ctrl.get_status()
+        assert st.desired_state == DesiredState.ENABLED.value
+        assert st.speaker_path_state == PathState.RUNNING.value
+        assert st.microphone_path_state == PathState.RUNNING.value
+        assert st.owned_children_count == 2
+        assert len(runner.running_pids) == 2
+
+        ctrl.shutdown_host()
+
+
+def test_start_host_stopped_by_user_retains_zero_media_children_and_stopped_mic(temp_state_file):
+    """Persisted STOPPED_BY_USER must never start microphone or speaker, maintaining 0 media children."""
+    with open(temp_state_file, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.STOPPED_BY_USER.value}, f)
+
+    runner = MockProcessRunner()
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        device_resolver=MockDeviceResolver(),
+        process_runner=runner,
+        pipeline_builder=MockPipelineBuilder(),
+        discovery_service=MockDiscoveryService(),
+        pack43_resolver=MockPack43Resolver(),
+        lock_port=52115,
+        ipc_port=52116,
+    )
+    with patch("windows.controller.check_runtime_dependencies", return_value=(True, "")):
+        ok = ctrl.start_host()
+        assert ok is True
+        st = ctrl.get_status()
+        assert st.desired_state == DesiredState.STOPPED_BY_USER.value
+        assert st.controller_state == LifecycleState.STOPPED.value
+        assert st.speaker_path_state == PathState.STOPPED.value
+        assert st.microphone_path_state == PathState.STOPPED.value
+        assert st.owned_children_count == 0
+        assert len(runner.running_pids) == 0
 
         ctrl.shutdown_host()
 

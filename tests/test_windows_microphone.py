@@ -14,10 +14,12 @@ Verifies:
 - Speaker behavior unchanged when mic is enabled/disabled/reconciled
 """
 
+import json
 import os
 import tempfile
 import time
 from typing import List, Optional
+from unittest.mock import patch
 import pytest
 
 from bridge_core.contract import (
@@ -211,7 +213,11 @@ def test_repeated_unavailable_resolve_does_not_enumerate_again_until_invalidate(
     assert resolver.is_cached_available is False
 
 
-def test_microphone_not_started_automatically_with_speaker(temp_state_file):
+def test_microphone_started_automatically_with_speaker_under_pre22_policy(temp_state_file):
+    """Under pre-#22 dual-active baseline policy, ctrl.start() automatically restores microphone intent
+
+    and activates both speaker and microphone when Pack43 is available.
+    """
     runner = FakeProcessRunner()
     pack43 = FakePack43Resolver(should_succeed=True)
     disc = FakeDiscoveryService()
@@ -227,10 +233,11 @@ def test_microphone_not_started_automatically_with_speaker(temp_state_file):
 
     ctrl.start()
     assert ctrl.get_status().speaker_path_state == PathState.RUNNING.value
-    assert ctrl.get_status().microphone_path_state == PathState.IDLE.value
-    # Only 1 process started (speaker)
-    assert len(runner.started_commands) == 1
-    assert ctrl.get_status().owned_children_count == 1
+    assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
+    # Both processes started (speaker + microphone)
+    assert len(runner.started_commands) == 2
+    assert ctrl.get_status().owned_children_count == 2
+    ctrl.shutdown()
 
 
 def test_microphone_enable_and_idempotent_start(temp_state_file):
@@ -248,9 +255,10 @@ def test_microphone_enable_and_idempotent_start(temp_state_file):
     )
 
     ctrl.start()
-    assert len(runner.started_commands) == 1
+    assert len(runner.started_commands) == 2
+    assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
 
-    # Enable microphone
+    # Re-enabling microphone is idempotent
     success = ctrl.set_microphone_enabled(True)
     assert success is True
     assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
@@ -265,6 +273,7 @@ def test_microphone_enable_and_idempotent_start(temp_state_file):
     ctrl.set_microphone_enabled(True)
     assert len(runner.started_commands) == 2
     assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
+    ctrl.shutdown()
 
 
 def test_microphone_disable_and_idempotent_stop(temp_state_file):
@@ -524,10 +533,8 @@ def test_mic_enable_negative_cache_and_reconcile_isolation(temp_state_file):
 
     ctrl.start()
     assert ctrl.get_status().speaker_path_state == PathState.RUNNING.value
-
-    # 1. Initial mic-enable -> transient Pack43 failure -> UNAVAILABLE / fail-closed
-    success1 = ctrl.set_microphone_enabled(True)
-    assert success1 is False
+    # Under pre-#22 policy, start() reconciles both speaker and microphone;
+    # since Pack43 is unavailable, enumeration occurs and status becomes UNAVAILABLE
     status1 = ctrl.get_status()
     assert status1.microphone_path_state == PathState.UNAVAILABLE.value
     assert status1.pack43_available is False
@@ -537,13 +544,12 @@ def test_mic_enable_negative_cache_and_reconcile_isolation(temp_state_file):
     # Transient condition clears (e.g. driver initialized / WMI responsive)
     pack43.should_succeed = True
 
-    # 2. Ordinary repeated reconcile() -> NO new WMI enumeration (hot path protected)
-    for _ in range(5):
-        ctrl.reconcile()
-    assert pack43.underlying_enumeration_count == 1, "Ordinary reconcile must not trigger WMI enumeration"
+    # 1. Ordinary repeated reconcile() before budget retry interval -> NO new WMI enumeration
+    ctrl.reconcile()
+    assert pack43.underlying_enumeration_count == 1, "Immediate reconcile must not trigger WMI enumeration"
     assert ctrl.get_status().microphone_path_state == PathState.UNAVAILABLE.value
 
-    # 3. Second explicit mic-enable -> invalidates negative cache -> fresh enumeration -> RUNNING
+    # 2. Explicit mic-enable -> invalidates negative cache -> fresh enumeration -> RUNNING
     success2 = ctrl.set_microphone_enabled(True)
     assert success2 is True
     assert pack43.underlying_enumeration_count == 2, "Explicit mic-enable must perform fresh enumeration"
@@ -676,3 +682,108 @@ def test_pack43_resolver_query_fails_closed_on_driver_mismatch():
     with patch.object(resolver, "_get_powershell_executable", return_value="pwsh.exe"):
         with patch("subprocess.run", side_effect=_mock_run_bad_version):
             assert resolver._query_pack43() is None
+
+
+def test_startup_transient_pack43_failure_recovers_within_budget_without_manual_mic_enable(temp_state_file):
+    """Under pre-#22 dual-active policy, when persisted ENABLED host starts up with transient Pack43 failure,
+
+    it automatically recovers and starts the microphone receiver once Pack43 becomes available within
+    the startup recovery budget, without requiring the user to run mic-enable again.
+    """
+    with open(temp_state_file, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    runner = FakeProcessRunner()
+    pack43 = FakePack43Resolver(should_succeed=False)
+    disc = FakeDiscoveryService()
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        discovery_service=disc,
+        pack43_resolver=pack43,
+        lock_port=50187,
+        ipc_port=50188,
+    )
+
+    with patch("windows.controller.check_runtime_dependencies", return_value=(True, "")):
+        # 1. Startup when Pack43 is transiently unavailable
+        ok = ctrl.start_host()
+        assert ok is True
+        st1 = ctrl.get_status()
+        assert st1.speaker_path_state == PathState.RUNNING.value
+        assert st1.microphone_path_state == PathState.UNAVAILABLE.value
+        assert st1.owned_children_count == 1
+        assert pack43.underlying_enumeration_count == 1
+
+        # 2. Pack43 driver / WMI becomes available during startup
+        pack43.should_succeed = True
+
+        # Simulate reconcile called before retry interval elapsed -> negative cache retained
+        ctrl.reconcile()
+        assert pack43.underlying_enumeration_count == 1
+        assert ctrl.get_status().microphone_path_state == PathState.UNAVAILABLE.value
+
+        # Fast forward time beyond STARTUP_PACK43_RETRY_INTERVAL_SEC
+        ctrl._last_pack43_attempt_time -= 3.0
+
+        # 3. Next reconcile within budget automatically probes and recovers without mic-enable
+        ctrl.reconcile()
+        assert pack43.underlying_enumeration_count == 2
+        st2 = ctrl.get_status()
+        assert st2.microphone_path_state == PathState.RUNNING.value
+        assert st2.owned_children_count == 2
+        assert len(runner.started_commands) == 2
+        assert "wasapi2sink" in runner.started_commands[1]
+
+        ctrl.shutdown_host()
+
+
+def test_startup_pack43_retry_stops_after_budget_exhaustion_no_steady_state_hammering(temp_state_file):
+    """When Pack43 remains unavailable, startup retries stop once max attempts are reached,
+
+    preventing infinite WMI enumeration during periodic steady-state reconcile.
+    """
+    with open(temp_state_file, "w", encoding="utf-8") as f:
+        json.dump({"desired_state": DesiredState.ENABLED.value}, f)
+
+    runner = FakeProcessRunner()
+    pack43 = FakePack43Resolver(should_succeed=False)
+    disc = FakeDiscoveryService()
+    ctrl = WindowsBridgeController(
+        state_file=temp_state_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        discovery_service=disc,
+        pack43_resolver=pack43,
+        lock_port=50189,
+        ipc_port=50190,
+    )
+
+    with patch("windows.controller.check_runtime_dependencies", return_value=(True, "")):
+        ctrl.start_host()
+        # Attempt 1 used on start_host
+        assert pack43.underlying_enumeration_count == 1
+
+        # Attempt 2
+        ctrl._last_pack43_attempt_time -= 3.0
+        ctrl.reconcile()
+        assert pack43.underlying_enumeration_count == 2
+
+        # Attempt 3 (reaches STARTUP_PACK43_MAX_ATTEMPTS = 3)
+        ctrl._last_pack43_attempt_time -= 3.0
+        ctrl.reconcile()
+        assert pack43.underlying_enumeration_count == 3
+
+        # Further steady-state reconciles must NOT trigger any new WMI enumerations
+        for _ in range(10):
+            ctrl._last_pack43_attempt_time -= 3.0
+            ctrl.reconcile()
+
+        assert pack43.underlying_enumeration_count == 3, "Exhausted budget must stop WMI enumeration"
+        st = ctrl.get_status()
+        assert st.microphone_path_state == PathState.UNAVAILABLE.value
+        assert st.owned_children_count == 1
+        assert len(runner.started_commands) == 1
+
+        ctrl.shutdown_host()
