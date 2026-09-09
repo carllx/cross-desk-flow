@@ -28,7 +28,6 @@ from typing import Dict, List, Optional, Tuple
 
 EXCLUDE_DIRS = {
     ".git",
-    "tests",
     "fixtures",
     "snapshots",
     "build",
@@ -127,8 +126,15 @@ def check_context(root_dir: Path, mission_base: Optional[str] = None) -> bool:
 def get_base_ref_loc(root_dir: Path, base_ref: str, rel_path: str) -> Optional[int]:
     """Retrieves line count of rel_path at base_ref git revision."""
     try:
-        content = run_git(["show", f"{base_ref}:{rel_path}"], cwd=root_dir)
-        return len(content.splitlines())
+        res = subprocess.run(
+            ["git", "show", f"{base_ref}:{rel_path}"],
+            cwd=root_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return len(res.stdout.splitlines())
     except Exception:
         return None
 
@@ -230,9 +236,23 @@ def main() -> int:
         default=None,
         help="Pre-#43 base commit SHA for legacy file No-Worse comparison",
     )
+    parser.add_argument(
+        "--repo-root",
+        type=str,
+        default=None,
+        help="Repository root directory (defaults to current directory if valid, else script parent)",
+    )
 
     args = parser.parse_args()
-    root_dir = Path(__file__).resolve().parent.parent
+    if args.repo_root:
+        root_dir = Path(args.repo_root).resolve()
+    else:
+        # Check if cwd is a git repo root with AGENTS.md
+        cwd = Path.cwd().resolve()
+        if (cwd / ".git").exists() or (cwd / "AGENTS.md").exists():
+            root_dir = cwd
+        else:
+            root_dir = Path(__file__).resolve().parent.parent
 
     success = True
     if args.subcommand in ("all", "context"):
