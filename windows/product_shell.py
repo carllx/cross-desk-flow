@@ -438,7 +438,30 @@ class ProductShellApp:
         self.root.destroy()
 
 
+def _attach_interactive_desktop():
+    """Ensure GUI thread attaches to the interactive 'Default' desktop on Windows.
+    
+    When launched from certain non-interactive parent environments or background
+    services, child processes inherit isolated desktops (e.g. exebox-*).
+    Switching to 'Default' desktop ensures the window renders on the active user session.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            # DESKTOP_CREATEMENU (0x0004) | DESKTOP_CREATEWINDOW (0x0002) | 
+            # DESKTOP_READOBJECTS (0x0001) | DESKTOP_WRITEOBJECTS (0x0080) |
+            # DESKTOP_SWITCHDESKTOP (0x0100) | GENERIC_WRITE (0x40000000)
+            access = 0x0100 | 0x0001 | 0x0004 | 0x0002 | 0x0080
+            hdesk = user32.OpenDesktopW("Default", 0, False, access)
+            if hdesk:
+                user32.SetThreadDesktop(hdesk)
+        except Exception:
+            pass
+
+
 def main():
+    _attach_interactive_desktop()
     root = tk.Tk()
     app = ProductShellApp(root)
     root.mainloop()
