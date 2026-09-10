@@ -390,12 +390,22 @@ def test_scheduled_task_registration_and_info():
         assert info is not None
         assert info["task_name"] == test_task
         assert info["enabled"] is True
+        # Principal remains current user with interactive token
+        assert info["run_as_user"]
+        assert info["logon_type"] == 3  # TASK_LOGON_INTERACTIVE_TOKEN
+        # Logon trigger with bounded startup delay
+        assert info["trigger_type"] == 9  # TASK_TRIGGER_LOGON
+        assert info["trigger_delay"] == "PT2S"
+        # StartWhenAvailable & battery restrictions disabled
+        assert info["start_when_available"] is True
+        assert info["disallow_start_if_on_batteries"] is False
+        assert info["stop_if_going_on_batteries"] is False
         # Bounded restart policy
         assert info["restart_count"] == 3
         assert info["restart_interval"] == "PT1M"
         # IgnoreNew policy
         assert info["multiple_instances"] == 2
-        # Explicit working directory
+        # Explicit working directory and action
         assert os.path.isdir(info["working_directory"])
         assert "pythonw.exe" in info["command"].lower()
         assert "launcher.py" in info["arguments"]
@@ -406,6 +416,39 @@ def test_scheduled_task_registration_and_info():
             ts = win32com.client.Dispatch("Schedule.Service")
             ts.Connect()
             ts.GetFolder("\\").DeleteTask(test_task, 0)
+        except Exception:
+            pass
+
+
+def test_unconstrained_trigger_access_denied_under_standard_user():
+    """Windows Task Scheduler rejects empty LogonTrigger.UserId with Access Denied (0x80070005)
+    for standard/non-elevated users. Confirms why user SID binding is required under standard user tokens.
+    """
+    import win32com.client
+    user_sid = get_current_user_sid()
+    ts = win32com.client.Dispatch("Schedule.Service")
+    ts.Connect()
+    folder = ts.GetFolder("\\")
+
+    test_task = "desk-audio-bridge-unconstrained-test"
+    td = ts.NewTask(0)
+    td.Principal.UserId = user_sid
+    td.Principal.LogonType = 3  # TASK_LOGON_INTERACTIVE_TOKEN
+    trigger = td.Triggers.Create(9)  # TASK_TRIGGER_LOGON
+    trigger.Enabled = True
+    # Deliberately leave trigger.UserId empty/unset
+    action = td.Actions.Create(0)
+    action.Path = resolve_windowless_python()
+
+    try:
+        with pytest.raises(Exception) as exc_info:
+            folder.RegisterTaskDefinition(test_task, td, 6, None, None, 3)
+        # Verify COM error HRESULT is -2147024891 (0x80070005 = E_ACCESSDENIED)
+        err_str = str(exc_info.value)
+        assert "-2147024891" in err_str or "Access is denied" in err_str
+    finally:
+        try:
+            folder.DeleteTask(test_task, 0)
         except Exception:
             pass
 

@@ -117,6 +117,7 @@ def get_scheduled_task_info(task_name: str = DEFAULT_TASK_NAME) -> Optional[Dict
         definition = task.Definition
         settings = definition.Settings
         actions = definition.Actions
+        triggers = definition.Triggers
 
         action_cmd = ""
         action_args = ""
@@ -127,16 +128,33 @@ def get_scheduled_task_info(task_name: str = DEFAULT_TASK_NAME) -> Optional[Dict
             action_args = getattr(act, "Arguments", "")
             action_workdir = getattr(act, "WorkingDirectory", "")
 
+        trigger_type = None
+        trigger_user = ""
+        trigger_delay = ""
+        if triggers.Count > 0:
+            trig = triggers.Item(1)
+            trigger_type = getattr(trig, "Type", None)
+            trigger_user = getattr(trig, "UserId", "")
+            trigger_delay = getattr(trig, "Delay", "")
+
         principal_user = definition.Principal.UserId
+        logon_type = getattr(definition.Principal, "LogonType", None)
 
         return {
             "task_name": task_name,
             "enabled": task.Enabled,
             "state": task.State,
             "run_as_user": principal_user,
+            "logon_type": logon_type,
             "restart_count": settings.RestartCount,
             "restart_interval": settings.RestartInterval,
             "multiple_instances": settings.MultipleInstances,
+            "start_when_available": settings.StartWhenAvailable,
+            "disallow_start_if_on_batteries": settings.DisallowStartIfOnBatteries,
+            "stop_if_going_on_batteries": settings.StopIfGoingOnBatteries,
+            "trigger_type": trigger_type,
+            "trigger_user": trigger_user,
+            "trigger_delay": trigger_delay,
             "command": action_cmd,
             "arguments": action_args,
             "working_directory": action_workdir,
@@ -181,10 +199,11 @@ def register_scheduled_task(task_name: str = DEFAULT_TASK_NAME, force: bool = Tr
         settings.RestartCount = 3  # Bounded restarts: max 3 attempts
         settings.RestartInterval = "PT1M"  # 1 minute interval
 
-        # Trigger: Logon trigger for current user
+        # Trigger: Logon trigger for current user with bounded delay for session readiness
         trigger = td.Triggers.Create(9)  # TASK_TRIGGER_LOGON
         trigger.Enabled = True
         trigger.UserId = user_sid
+        trigger.Delay = "PT2S"  # Bounded delay ensuring user desktop, shell, and audio endpoints are ready
 
         # Action: Exec pythonw.exe launcher.py with WorkingDirectory = repo_root
         action = td.Actions.Create(0)  # TASK_ACTION_EXEC
