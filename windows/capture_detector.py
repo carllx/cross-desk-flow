@@ -51,15 +51,25 @@ else:
 class WasapiCaptureSessionDetector:
     """Detects active WASAPI audio client capture sessions on a specified endpoint."""
 
-    def __init__(self, query_func: Optional[Callable[[str], bool]] = None):
+    def __init__(
+        self,
+        query_func: Optional[Callable[[str], bool]] = None,
+        co_init_func: Optional[Callable[[], int]] = None,
+        co_uninit_func: Optional[Callable[[], None]] = None,
+    ):
         self._query_func = query_func
+        self._co_init_func = co_init_func
+        self._co_uninit_func = co_uninit_func
 
     def is_capture_active(self, endpoint_id: str) -> bool:
         """Returns True if at least one audio session on endpoint_id is in AudioSessionStateActive."""
         if self._query_func is not None:
             return bool(self._query_func(endpoint_id))
 
-        if sys.platform != "win32" or not endpoint_id:
+        if not endpoint_id:
+            return False
+
+        if sys.platform != "win32" and self._co_init_func is None:
             return False
 
         return self._query_wasapi(endpoint_id)
@@ -68,9 +78,27 @@ class WasapiCaptureSessionDetector:
         if "{" in endpoint_id:
             endpoint_id = endpoint_id[endpoint_id.index("{"):]
 
-        ole32 = ctypes.windll.ole32
-        co_inited = ole32.CoInitialize(None) == 0
+        ole32 = getattr(ctypes.windll, "ole32", None) if sys.platform == "win32" else None
+        need_uninit = False
+        if self._co_init_func is not None:
+            try:
+                hr = self._co_init_func()
+                need_uninit = hr in (0, 1)
+            except Exception as exc:
+                logger.debug("Custom COM init failed: %s", exc)
+                return False
+        elif ole32 is not None:
+            try:
+                hr = ole32.CoInitialize(None)
+                # S_OK (0) and S_FALSE (1) are successful COM initializations that must be balanced by CoUninitialize()
+                need_uninit = hr in (0, 1)
+            except Exception as exc:
+                logger.debug("CoInitialize failed: %s", exc)
+                return False
+
         try:
+            if ole32 is None:
+                return False
             p_enum = ctypes.c_void_p()
             hr = ole32.CoCreateInstance(
                 ctypes.byref(CLSID_MMDeviceEnumerator),
@@ -214,8 +242,17 @@ class WasapiCaptureSessionDetector:
             logger.debug("Error checking capture activity for %s: %s", endpoint_id, exc)
             return False
         finally:
-            if co_inited:
-                ole32.CoUninitialize()
+            if need_uninit:
+                if self._co_uninit_func is not None:
+                    try:
+                        self._co_uninit_func()
+                    except Exception:
+                        pass
+                elif ole32 is not None:
+                    try:
+                        ole32.CoUninitialize()
+                    except Exception:
+                        pass
         return False
 
 
@@ -261,8 +298,10 @@ class WindowsMicrophoneDemandMonitor:
     def start(self) -> None:
         """Starts the background demand monitor thread idempotently."""
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
+            if self._thread is not None:
+                if self._thread.is_alive():
+                    return
+                self._thread = None
             self._stop_event.clear()
             self._auto_dictation_active = False
             self._last_active_time = 0.0
@@ -274,14 +313,41 @@ class WindowsMicrophoneDemandMonitor:
             )
             self._thread.start()
 
-    def stop(self, timeout: float = 1.0) -> None:
-        """Stops the demand monitor thread idempotently."""
+    def stop(self, timeout: float = 2.0) -> bool:
+        """Stops the demand monitor thread idempotently.
+        
+        Guarantees that:
+        - self._thread reference is NEVER cleared if the thread is still alive;
+        - Does not hold self._lock while waiting for join;
+        - Returns True if thread is stopped or was not running, False if join timed out.
+        """
+        self._stop_event.set()
+        thread_to_join = None
         with self._lock:
-            self._stop_event.set()
             if self._thread is not None:
-                self._thread.join(timeout=timeout)
-                self._thread = None
+                if self._thread.is_alive():
+                    thread_to_join = self._thread
+                else:
+                    self._thread = None
+
+        if thread_to_join is not None:
+            thread_to_join.join(timeout=timeout)
+            with self._lock:
+                if not thread_to_join.is_alive():
+                    self._thread = None
+                    self._auto_dictation_active = False
+                    return True
+                else:
+                    logger.warning(
+                        "Demand monitor thread %s did not terminate within %ss timeout",
+                        thread_to_join.name,
+                        timeout,
+                    )
+                    return False
+
+        with self._lock:
             self._auto_dictation_active = False
+        return True
 
     def check_demand_step(self) -> None:
         """Performs a single evaluation step of microphone demand.
@@ -354,8 +420,8 @@ class WindowsMicrophoneDemandMonitor:
         co_inited = False
         if sys.platform == "win32":
             try:
-                ctypes.windll.ole32.CoInitializeEx(None, 0)
-                co_inited = True
+                hr = ctypes.windll.ole32.CoInitializeEx(None, 0)
+                co_inited = hr in (0, 1)
             except Exception:
                 pass
 

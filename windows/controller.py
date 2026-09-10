@@ -248,11 +248,11 @@ class WindowsBridgeController:
                 self._last_actionable_error = f"Discovery start failed: {exc}"
                 self._controller_state = LifecycleState.ERROR
 
-            # Start demand monitor
-            self.demand_monitor.start()
-
             self.reconcile()
-            return True
+
+        # Start demand monitor outside self._lock
+        self.demand_monitor.start()
+        return True
 
     def set_microphone_enabled(self, enabled: bool) -> bool:
         """Explicit desired-state control seam for Windows microphone capability."""
@@ -292,10 +292,12 @@ class WindowsBridgeController:
             self._persist_desired_state(DesiredState.STOPPED_BY_USER)
             self._reset_dictation_and_recovery_tracking()
             self._stop_active_pipelines(PathState.STOPPED)
-            self.demand_monitor.stop()
             self.discovery_service.stop()
             self._controller_state = LifecycleState.STOPPED
-            return True
+
+        # Stop demand monitor outside self._lock to prevent deadlock with worker thread
+        self.demand_monitor.stop()
+        return True
 
     def start_host(self) -> bool:
         """Starts controller host runtime according to persisted desired state without mutating it.
@@ -307,6 +309,8 @@ class WindowsBridgeController:
         - If ENABLED: defaults to PLAYBACK (microphone False), starts discovery, and reconciles pipelines.
         - If STOPPED_BY_USER: leaves controller in STOPPED state with zero media children.
         """
+        should_start_monitor = False
+        should_stop_monitor = False
         with self._lock:
             ok, err_msg = check_runtime_dependencies()
             if not ok:
@@ -333,16 +337,21 @@ class WindowsBridgeController:
                 except Exception as exc:
                     self._last_actionable_error = f"Discovery start failed: {exc}"
                     self._controller_state = LifecycleState.ERROR
-                self.demand_monitor.start()
+                should_start_monitor = True
                 self.reconcile()
             else:
                 self._reset_dictation_and_recovery_tracking()
                 self._controller_state = LifecycleState.STOPPED
                 self._speaker_path_state = PathState.STOPPED
                 self._microphone_path_state = PathState.STOPPED
-                self.demand_monitor.stop()
+                should_stop_monitor = True
 
-            return True
+        if should_start_monitor:
+            self.demand_monitor.start()
+        elif should_stop_monitor:
+            self.demand_monitor.stop()
+
+        return True
 
     def request_host_shutdown(self) -> None:
         """Requests graceful host shutdown from the host main loop without mutating desired state."""
@@ -360,11 +369,13 @@ class WindowsBridgeController:
             self._current_dictation_session = None
             self._dictation_ack_event.clear()
             self._stop_active_pipelines(PathState.STOPPED)
-            self.demand_monitor.stop()
             self.discovery_service.stop()
             self._ipc_server.stop()
             self._singleton_lock.release()
             self._controller_state = LifecycleState.STOPPED
+
+        # Stop demand monitor outside self._lock to prevent deadlock with worker thread
+        self.demand_monitor.stop()
 
     def shutdown(self) -> None:
         """Full shutdown of controller host. Deprecated alias for shutdown_host."""

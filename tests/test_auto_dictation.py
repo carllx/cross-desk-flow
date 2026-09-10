@@ -22,6 +22,7 @@ Verifies:
    - Stopped: Speaker Stopped, Mic Stopped, Voice input Standby / Off.
 """
 
+import threading
 import time
 from unittest.mock import MagicMock, patch
 import pytest
@@ -332,3 +333,144 @@ def test_product_shell_ui_mapping_automatic_dictation():
     assert stopped_ui.speaker == DIRECTION_STOPPED
     assert stopped_ui.microphone == DIRECTION_STOPPED
     assert stopped_ui.voice_input == VOICE_INPUT_OFF
+
+
+def test_com_init_uninit_balance_s_ok():
+    """Verify S_OK (0) causes exactly one CoUninitialize call."""
+    uninit_calls = 0
+
+    def fake_init():
+        return 0  # S_OK
+
+    def fake_uninit():
+        nonlocal uninit_calls
+        uninit_calls += 1
+
+    detector = WasapiCaptureSessionDetector(
+        co_init_func=fake_init,
+        co_uninit_func=fake_uninit,
+    )
+    # Query an empty endpoint (will fail early in COM setup, but triggers init -> finally uninit)
+    detector.is_capture_active("{mock-endpoint}")
+    assert uninit_calls == 1
+
+
+def test_com_init_uninit_balance_s_false():
+    """Verify S_FALSE (1, already initialized on thread) causes exactly one CoUninitialize call."""
+    uninit_calls = 0
+
+    def fake_init():
+        return 1  # S_FALSE
+
+    def fake_uninit():
+        nonlocal uninit_calls
+        uninit_calls += 1
+
+    detector = WasapiCaptureSessionDetector(
+        co_init_func=fake_init,
+        co_uninit_func=fake_uninit,
+    )
+    detector.is_capture_active("{mock-endpoint}")
+    assert uninit_calls == 1
+
+
+def test_com_init_uninit_balance_error_no_uninit():
+    """Verify failed CoInitialize does NOT call CoUninitialize."""
+    uninit_calls = 0
+
+    def fake_init():
+        return -2147467259  # E_FAIL
+
+    def fake_uninit():
+        nonlocal uninit_calls
+        uninit_calls += 1
+
+    detector = WasapiCaptureSessionDetector(
+        co_init_func=fake_init,
+        co_uninit_func=fake_uninit,
+    )
+    detector.is_capture_active("{mock-endpoint}")
+    assert uninit_calls == 0
+
+
+def test_monitor_stop_retains_thread_reference_on_timeout():
+    """Verify demand_monitor.stop() does NOT set _thread = None if thread join times out."""
+    controller = MockController()
+    worker_started = threading.Event()
+    block_event = threading.Event()
+
+    class BlockingDetector(WasapiCaptureSessionDetector):
+        def is_capture_active(self, endpoint_id: str) -> bool:
+            worker_started.set()
+            block_event.wait(timeout=2.0)
+            return False
+
+    monitor = WindowsMicrophoneDemandMonitor(
+        controller=controller,
+        detector=BlockingDetector(),
+        poll_interval=0.01,
+    )
+    monitor.start()
+    assert monitor.is_running
+    assert worker_started.wait(timeout=2.0)
+
+    # Call stop with very small timeout while worker is blocked
+    stopped = monitor.stop(timeout=0.02)
+    assert not stopped  # Timed out
+    assert monitor._thread is not None  # Retained reference
+    assert monitor._thread.is_alive()
+
+    # Unblock worker and cleanly stop
+    block_event.set()
+    stopped_clean = monitor.stop(timeout=2.0)
+    assert stopped_clean
+    assert monitor._thread is None
+
+
+def test_controller_stop_no_deadlock_with_monitor_worker():
+    """Regression test: worker thread attempting to start_dictation while controller.stop() is called.
+    
+    Verifies that because demand_monitor.stop() is outside controller._lock,
+    and stop() sets desired_state = STOPPED_BY_USER, there is no deadlock and
+    both threads exit cleanly.
+    """
+    controller = MockController()
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+
+    def slow_start_dictation(timeout=3.0):
+        worker_entered.set()
+        release_worker.wait(timeout=2.0)
+        return True
+
+    controller.start_dictation = slow_start_dictation
+    detector = WasapiCaptureSessionDetector(query_func=lambda ep: True)
+    monitor = WindowsMicrophoneDemandMonitor(
+        controller=controller,
+        detector=detector,
+        poll_interval=0.01,
+    )
+
+    monitor.start()
+    # Wait until worker has started dictation call
+    assert worker_entered.wait(timeout=2.0)
+
+    # Controller stop called from another thread
+    stop_finished = threading.Event()
+
+    def do_stop():
+        controller._desired_state = DesiredState.STOPPED_BY_USER
+        monitor.stop(timeout=2.0)
+        stop_finished.set()
+
+    t_stop = threading.Thread(target=do_stop)
+    t_stop.start()
+
+    # Release the worker
+    release_worker.set()
+
+    t_stop.join(timeout=3.0)
+    assert not t_stop.is_alive()
+    assert stop_finished.is_set()
+    assert not monitor.is_running
+
