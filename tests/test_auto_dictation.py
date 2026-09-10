@@ -32,7 +32,7 @@ from windows.capture_detector import (
     WasapiCaptureSessionDetector,
     WindowsMicrophoneDemandMonitor,
 )
-from windows.pack43_resolver import Pack43ResolutionResult
+from windows.pack43_resolver import Pack43ResolutionResult, Pack43Resolver
 from windows.product_shell import (
     DIRECTION_ACTIVE,
     DIRECTION_PAUSED_VOICE,
@@ -63,6 +63,8 @@ class MockController:
 
         # Pack43 mock
         self.pack43_resolver = MagicMock()
+        self.pack43_resolver.is_cached_available = True
+        self.pack43_resolver.has_probed = True
         self.pack43_resolver.resolve_pack43.return_value = Pack43ResolutionResult(
             render_endpoint_id="{mock-render}",
             capture_endpoint_id="{mock-capture}",
@@ -473,4 +475,76 @@ def test_controller_stop_no_deadlock_with_monitor_worker():
     assert not t_stop.is_alive()
     assert stop_finished.is_set()
     assert not monitor.is_running
+
+
+def test_pack43_transient_negative_recovers_after_retry_window():
+    """Verify that a cold/transient negative Pack43 resolution:
+    1. First resolution is negative (unprobed -> negative).
+    2. Immediate repeated polling does NOT repeatedly enumerate (bounded).
+    3. After retry window, Pack43 becomes available -> monitor obtains capture endpoint.
+    4. Active capture then causes start_dictation() exactly once.
+    """
+    controller = MockController()
+    # Intercept resolver with simulated query counts and outcome progression
+    query_count = 0
+    pack43_available = False
+
+    class ControlledResolver(Pack43Resolver):
+        def _query_pack43(self):
+            nonlocal query_count
+            query_count += 1
+            if pack43_available:
+                return Pack43ResolutionResult(
+                    render_endpoint_id="{mock-render}",
+                    capture_endpoint_id="{mock-capture}",
+                    driver_version="1.0.3.5",
+                )
+            return None
+
+    resolver = ControlledResolver()
+    controller.pack43_resolver = resolver
+
+    # Active capture detector
+    detector = WasapiCaptureSessionDetector(query_func=lambda ep: True)
+    monitor = WindowsMicrophoneDemandMonitor(
+        controller=controller,
+        detector=detector,
+        poll_interval=0.01,
+        pack43_retry_interval=1.0,
+    )
+
+    # 1. First poll: unprobed -> queries once -> negative result
+    monitor.check_demand_step()
+    assert query_count == 1
+    assert resolver.is_cached_available is False
+    assert controller.start_dictation_calls == 0
+    assert not monitor.is_auto_dictation_active
+
+    # 2. Immediate repeated polling: within retry interval, does NOT repeatedly enumerate
+    for _ in range(5):
+        monitor.check_demand_step()
+    assert query_count == 1  # Query count must remain 1
+    assert controller.start_dictation_calls == 0
+
+    # 3. Pack43 hardware becomes available, but time hasn't advanced past retry interval
+    pack43_available = True
+    monitor.check_demand_step()
+    assert query_count == 1
+    assert controller.start_dictation_calls == 0
+
+    # 4. Advance time past retry window (simulate monotonic time progression)
+    monitor._last_pack43_retry -= 1.5
+    monitor.check_demand_step()
+
+    # 5. Monitor re-enumerated, obtained capture endpoint, and triggered start_dictation() exactly once
+    assert query_count == 2
+    assert resolver.is_cached_available is True
+    assert controller.start_dictation_calls == 1
+    assert monitor.is_auto_dictation_active
+
+    # 6. Subsequent polling reuses positive cache without re-querying WMI
+    monitor.check_demand_step()
+    assert query_count == 2
+    assert controller.start_dictation_calls == 1
+
 

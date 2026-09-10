@@ -272,11 +272,13 @@ class WindowsMicrophoneDemandMonitor:
         detector: Optional[WasapiCaptureSessionDetector] = None,
         poll_interval: float = 0.1,
         end_grace_seconds: float = 0.5,
+        pack43_retry_interval: float = 2.0,
     ):
         self.controller = controller
         self.detector = detector or WasapiCaptureSessionDetector()
         self.poll_interval = poll_interval
         self.end_grace_seconds = end_grace_seconds
+        self.pack43_retry_interval = pack43_retry_interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -285,6 +287,7 @@ class WindowsMicrophoneDemandMonitor:
         self._auto_dictation_active = False
         self._last_active_time: float = 0.0
         self._failed_cooldown: float = 0.0
+        self._last_pack43_retry: float = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -306,6 +309,7 @@ class WindowsMicrophoneDemandMonitor:
             self._auto_dictation_active = False
             self._last_active_time = 0.0
             self._failed_cooldown = 0.0
+            self._last_pack43_retry = time.time()
             self._thread = threading.Thread(
                 target=self._run,
                 name="windows-demand-monitor",
@@ -378,7 +382,22 @@ class WindowsMicrophoneDemandMonitor:
         if not pack43:
             return
 
-        pack43_result = pack43.resolve_pack43()
+        now = time.time()
+        # If already positive cached, reuse cached endpoint without re-probing
+        if pack43.is_cached_available is True:
+            pack43_result = pack43.resolve_pack43()
+        elif not pack43.has_probed:
+            # Unprobed: initial resolution attempt
+            pack43_result = pack43.resolve_pack43()
+            self._last_pack43_retry = now
+        else:
+            # Cached negative: bounded low-frequency retry gate
+            if (now - self._last_pack43_retry) >= self.pack43_retry_interval:
+                self._last_pack43_retry = now
+                pack43_result = pack43.resolve_pack43(force_refresh=True)
+            else:
+                return
+
         if not pack43_result or not pack43_result.capture_endpoint_id:
             return
 
@@ -386,7 +405,6 @@ class WindowsMicrophoneDemandMonitor:
 
         # 5. Query WASAPI capture activity
         is_active = self.detector.is_capture_active(endpoint_id)
-        now = time.time()
         current_mode = getattr(c.dictation_coordinator, "mode", "PLAYBACK")
 
         if is_active:
