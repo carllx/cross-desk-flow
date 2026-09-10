@@ -94,6 +94,10 @@ class MockPack43Resolver:
             driver_version="1.0.3.5",
         )
 
+    def resolve_for_explicit_demand(self):
+        force_refresh = self.is_cached_available is False
+        return self.resolve_pack43(force_refresh=force_refresh)
+
     def invalidate_cache(self):
         pass
 

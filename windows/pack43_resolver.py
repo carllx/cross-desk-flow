@@ -98,6 +98,17 @@ class Pack43Resolver:
             self._has_cached = True
             return None
 
+    def resolve_for_explicit_demand(self) -> Optional[Pack43ResolutionResult]:
+        """Resolves Pack43 specifically for an explicit user or dictation demand edge:
+
+        - Positive cache -> reuse cached positive without WMI re-enumeration.
+        - Fresh / unprobed -> ordinary probe.
+        - Negative cache -> perform exactly one fresh resolution to recover from stale negative state,
+          updating the cache with real result.
+        """
+        force_refresh = self.is_cached_available is False
+        return self.resolve_pack43(force_refresh=force_refresh)
+
     def _query_pack43(self) -> Optional[Pack43ResolutionResult]:
         """Queries WMI/CIM via PowerShell for Pack43 driver and render endpoints."""
         pwsh = self._get_powershell_executable()

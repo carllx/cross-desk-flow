@@ -87,8 +87,8 @@ class WindowsDictationCoordinator:
                 c._speaker_child_pid = None
             c._speaker_path_state = PathState.STOPPED
 
-            # 2. Resolve Pack43
-            pack43_result = c.pack43_resolver.resolve_pack43()
+            # 2. Resolve Pack43 with explicit-demand recovery
+            pack43_result = c.pack43_resolver.resolve_for_explicit_demand()
             if not pack43_result:
                 c._last_actionable_microphone_error = (
                     "Standard VB-CABLE Pack43 not found or driver identity mismatch"
