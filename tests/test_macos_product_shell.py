@@ -402,3 +402,117 @@ def test_open_data_directory(tmp_path):
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
         assert args[0] == "open"
+
+
+def test_start_controller_via_lifecycle_disabled_fails_closed():
+    """When LaunchAgent is Disabled, recovery returns False with zero lifecycle mutation."""
+    from unittest.mock import MagicMock, patch
+    from macos.diagnostics import start_controller_via_lifecycle
+
+    mock_res = MagicMock()
+    mock_res.returncode = 0
+    mock_res.stdout = '\t"com.carllx.desk-audio-bridge.controller" => disabled\n'
+
+    with patch("macos.diagnostics.run_launchctl", return_value=mock_res) as mock_run, \
+         patch("macos.lifecycle.install_launch_agent") as mock_install:
+
+        recovered = start_controller_via_lifecycle(timeout_sec=0.2)
+        assert recovered is False
+        mock_install.assert_not_called()
+        # Ensure kickstart or bootstrap was never called
+        for call_args in mock_run.call_args_list:
+            cmd = call_args[0][0]
+            assert "kickstart" not in cmd
+            assert "bootstrap" not in cmd
+            assert "load" not in cmd
+
+
+def test_query_launchagent_status_fails_closed_to_unknown_when_query_fails(tmp_path):
+    """When print-disabled query fails or errors, status is Unknown even if plist exists."""
+    from unittest.mock import MagicMock, patch
+    from macos.diagnostics import _query_launchagent_status, start_controller_via_lifecycle
+
+    dummy_plist = tmp_path / "com.carllx.desk-audio-bridge.controller.plist"
+    dummy_plist.write_text("dummy", encoding="utf-8")
+
+    err_res = MagicMock()
+    err_res.returncode = 1
+    err_res.stdout = ""
+    err_res.stderr = "launchctl error"
+
+    with patch("macos.diagnostics.run_launchctl", return_value=err_res) as mock_run, \
+         patch("macos.lifecycle.install_launch_agent") as mock_install:
+
+        status = _query_launchagent_status(plist_path=str(dummy_plist))
+        assert status == "Unknown"
+
+        recovered = start_controller_via_lifecycle(timeout_sec=0.2, plist_path=str(dummy_plist))
+        assert recovered is False
+        mock_install.assert_not_called()
+
+
+def test_start_controller_bootstrap_failure_does_not_invoke_load_w(tmp_path):
+    """When bootstrap fails, recovery returns False without calling load -w or mutating state."""
+    from unittest.mock import MagicMock, patch
+    from macos.diagnostics import start_controller_via_lifecycle
+
+    dummy_plist = tmp_path / "com.carllx.desk-audio-bridge.controller.plist"
+    dummy_plist.write_text("dummy", encoding="utf-8")
+
+    print_disabled_res = MagicMock()
+    print_disabled_res.returncode = 0
+    print_disabled_res.stdout = ""
+
+    bootstrap_fail_res = MagicMock()
+    bootstrap_fail_res.returncode = 1
+    bootstrap_fail_res.stderr = "bootstrap failed"
+
+    def mock_run_launchctl(cmd):
+        if "print-disabled" in cmd:
+            return print_disabled_res
+        if "bootstrap" in cmd:
+            return bootstrap_fail_res
+        return MagicMock(returncode=1)
+
+    with patch("macos.diagnostics.run_launchctl", side_effect=mock_run_launchctl) as mock_run, \
+         patch("macos.diagnostics.is_service_loaded", return_value=False), \
+         patch("macos.lifecycle.install_launch_agent") as mock_install:
+
+        recovered = start_controller_via_lifecycle(timeout_sec=0.2, plist_path=str(dummy_plist))
+        assert recovered is False
+        mock_install.assert_not_called()
+        # Verify load -w was never called
+        for call_args in mock_run.call_args_list:
+            cmd = call_args[0][0]
+            assert "load" not in cmd
+            assert "-w" not in cmd
+
+
+def test_start_controller_existing_enabled_and_loaded_kickstarts():
+    """When LaunchAgent is verified enabled and loaded, kickstart recovery works."""
+    from unittest.mock import MagicMock, patch
+    from macos.diagnostics import start_controller_via_lifecycle
+
+    print_disabled_res = MagicMock()
+    print_disabled_res.returncode = 0
+    print_disabled_res.stdout = '\t"com.carllx.desk-audio-bridge.controller" => enabled\n'
+
+    kickstart_res = MagicMock()
+    kickstart_res.returncode = 0
+
+    def mock_run_launchctl(cmd):
+        if "print-disabled" in cmd:
+            return print_disabled_res
+        if "kickstart" in cmd:
+            return kickstart_res
+        return MagicMock(returncode=0)
+
+    with patch("macos.diagnostics.run_launchctl", side_effect=mock_run_launchctl) as mock_run, \
+         patch("macos.diagnostics.is_service_loaded", return_value=True), \
+         patch("macos.cli.send_ipc_command", return_value={"owner_pid": 8888}):
+
+        recovered = start_controller_via_lifecycle(timeout_sec=1.0)
+        assert recovered is True
+
+        called_kickstart = any("kickstart" in call_args[0][0] for call_args in mock_run.call_args_list)
+        assert called_kickstart is True

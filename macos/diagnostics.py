@@ -134,30 +134,57 @@ def _query_launchagent_status(
     plist_path: Optional[str] = None,
     label: str = LAUNCH_AGENT_LABEL,
 ) -> str:
-    """Queries LaunchAgent status: 'Installed', 'Disabled', 'Not installed', or 'Unknown'."""
+    """Queries LaunchAgent status: 'Installed', 'Disabled', 'Not installed', or 'Unknown'.
+
+    Strict fail-closed rules:
+    - Queries launchctl print-disabled to check disabled status.
+    - If print-disabled fails or raises an error, cannot reliably know disabled/enabled state.
+      Returns 'Unknown' even if plist exists.
+    - If disabled, returns 'Disabled'.
+    - If loaded in launchd, returns 'Installed'.
+    - If not loaded in launchd and plist exists:
+      Returns 'Installed' only if print-disabled confirmed service is not disabled.
+    - If plist does not exist and service is not loaded in launchd, returns 'Not installed'.
+    """
     target_plist = plist_path or DEFAULT_PLIST_PATH
 
-    # Check print-disabled first
+    # Check print-disabled authoritatively
+    disabled_query_ok = False
+    is_disabled = False
     try:
         uid = get_current_uid()
         res_disabled = run_launchctl(["launchctl", "print-disabled", f"gui/{uid}"])
         if res_disabled.returncode == 0:
+            disabled_query_ok = True
             for line in res_disabled.stdout.splitlines():
-                if f'"{label}" => true' in line:
-                    return "Disabled"
+                if f'"{label}" => true' in line or f'"{label}" => disabled' in line:
+                    is_disabled = True
+                    break
+        else:
+            disabled_query_ok = False
     except Exception:
-        pass
+        disabled_query_ok = False
 
-    # Check if loaded via launchctl print gui/<uid>/<label>
+    if is_disabled:
+        return "Disabled"
+
+    # If disabled state could not be verified authoritatively, fail closed to Unknown
+    if not disabled_query_ok:
+        return "Unknown"
+
+    # Check if loaded via launchctl
     try:
         if is_service_loaded(label):
             return "Installed"
     except Exception:
-        pass
+        return "Unknown"
 
-    # If not loaded in launchd, check if plist exists
-    if os.path.isfile(target_plist):
-        return "Installed"
+    # Service is confirmed not disabled by print-disabled: check plist existence
+    try:
+        if os.path.isfile(target_plist):
+            return "Installed"
+    except Exception:
+        return "Unknown"
 
     return "Not installed"
 
@@ -186,33 +213,39 @@ def start_controller_via_lifecycle(
     """Recovers an absent controller using existing LaunchAgent lifecycle authority.
 
     Strict rules:
-    - If LaunchAgent plist or service is absent/disabled, DO NOT install or register.
-    - Never directly spawns macos.cli run from the UI process.
-    - Never creates a second lifecycle or broad-kills existing processes.
-    - Uses launchctl kickstart or launchctl bootstrap to wake the existing LaunchAgent.
+    - If LaunchAgent authority is not positively verified as 'Installed', DO NOT attempt recovery.
+    - If Disabled, Not installed, or Unknown, returns False immediately.
+    - Never installs a new LaunchAgent, never registers, never modifies disabled/enabled config.
+    - Never calls 'launchctl load -w' as a recovery fallback (never modifies state).
+    - If loaded: kickstarts existing loaded service via 'launchctl kickstart -k'.
+    - If verified installed but currently unloaded: bootstraps existing plist via 'launchctl bootstrap'.
+    - If bootstrap or kickstart fails, returns truthful failure (False).
     - Waits boundedly for the controller to become responsive on IPC.
     """
     from macos.cli import send_ipc_command
 
     target_plist = plist_path or DEFAULT_PLIST_PATH
     autostart = _query_launchagent_status(plist_path=target_plist, label=label)
-    if autostart not in ("Installed",):
+    if autostart != "Installed":
         return False
 
     uid = get_current_uid()
 
-    # If service is loaded in launchd, kickstart it
+    # If service is currently loaded in launchd, kickstart it
     if is_service_loaded(label):
         res = run_launchctl(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"])
         if res.returncode != 0:
-            run_launchctl(["launchctl", "kickstart", f"gui/{uid}/{label}"])
+            res = run_launchctl(["launchctl", "kickstart", f"gui/{uid}/{label}"])
+            if res.returncode != 0:
+                return False
     else:
-        # Service plist exists but not currently bootstrapped: bootstrap it
+        # Verified installed but temporarily unloaded: bootstrap existing plist without -w
         if not os.path.isfile(target_plist):
             return False
         res = run_launchctl(["launchctl", "bootstrap", f"gui/{uid}", target_plist])
         if res.returncode != 0:
-            run_launchctl(["launchctl", "load", "-w", target_plist])
+            # Strictly do NOT call launchctl load -w or modify enable state; fail truthfully
+            return False
 
     start = time.time()
     while time.time() - start < timeout_sec:
