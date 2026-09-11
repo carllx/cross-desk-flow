@@ -180,3 +180,86 @@ def test_client_stop_calls_ipc_only_no_process_killing():
         assert res == {"success": True}
         mock_ipc.assert_called_once_with("stop", port=50106, timeout=2.0)
         mock_popen.assert_not_called()
+
+
+def test_client_reconcile_calls_ipc_only():
+    """Client reconcile only calls send_ipc_command('reconcile')."""
+    client = ProductShellClient(port=50106)
+    with patch("windows.product_shell.send_ipc_command") as mock_ipc, \
+         patch("subprocess.Popen") as mock_popen:
+        mock_ipc.return_value = {"reconciled": True}
+        res = client.reconcile()
+        assert res == {"reconciled": True}
+        mock_ipc.assert_called_once_with("reconcile", port=50106, timeout=3.0)
+        mock_popen.assert_not_called()
+
+
+def test_network_path_classification():
+    """Classifies ethernet, wifi, and unknown interfaces correctly."""
+    from bridge_core.interface_classifier import InterfaceMedium
+    from windows.diagnostics import classify_network_path
+
+    mock_classifier = MagicMock()
+    mock_classifier.classify_interface.return_value = InterfaceMedium.WIRED_ETHERNET
+    assert classify_network_path("192.168.1.50", classifier=mock_classifier) == "Ethernet"
+
+    mock_classifier.classify_interface.return_value = InterfaceMedium.WIFI
+    assert classify_network_path("192.168.1.51", classifier=mock_classifier) == "Wi-Fi"
+
+    mock_classifier.classify_interface.return_value = InterfaceMedium.OTHER
+    assert classify_network_path("10.0.0.5", classifier=mock_classifier) == "Fallback (other)"
+
+    assert classify_network_path(None) == "Unknown"
+    assert classify_network_path("127.0.0.1") == "Unknown"
+
+
+def test_build_diagnostic_report_running_sanitization():
+    """build_diagnostic_report produces structured plain text without secrets/raw hardware IDs."""
+    from windows.diagnostics import build_diagnostic_report
+
+    status = {
+        "controller_state": "RUNNING",
+        "desired_state": "RUNNING",
+        "owner_pid": 12345,
+        "peer_available": True,
+        "peer_address": "192.168.1.99:50105",
+        "local_bind_address": "192.168.1.50",
+        "speaker_path_state": "RUNNING",
+        "microphone_path_state": "RUNNING",
+        "mode": "PLAYBACK",
+        "voice_input_active": False,
+        "pack43_available": True,
+        "last_actionable_error": None,
+        "last_actionable_microphone_error": None,
+    }
+
+    report = build_diagnostic_report(status)
+    assert "=== Cross-Desk Flow Diagnostic Report ===" in report
+    assert "Controller: RUNNING (PID 12345)" in report
+    assert "Peer State: Connected (192.168.1.99:50105)" in report
+    assert "Auto Start:" in report
+    assert "Speaker Path: RUNNING" in report
+    assert "Microphone Path: RUNNING" in report
+    assert "Voice Input: Automatic / Standby" in report
+    assert "Pack43 Readiness: Available" in report
+    assert "Last Actionable Error: None" in report
+
+    # Verify no raw hardware GUID format {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} or sensitive fields
+    import re
+    assert not re.search(r"\{[0-9a-fA-F-]{36}\}", report)
+    assert "password" not in report.lower()
+    assert "token" not in report.lower()
+
+
+def test_build_diagnostic_report_controller_absent():
+    """build_diagnostic_report handles None status gracefully."""
+    from windows.diagnostics import build_diagnostic_report
+
+    report = build_diagnostic_report(None)
+    assert "Controller: NOT RUNNING" in report
+    assert "Peer State: NONE" in report
+    assert "Speaker Path: STOPPED" in report
+    assert "Microphone Path: STOPPED" in report
+    assert "Voice Input: Standby / Off" in report
+    assert "Last Actionable Error: Background service is not running" in report
+

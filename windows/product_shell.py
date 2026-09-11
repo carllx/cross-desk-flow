@@ -32,164 +32,33 @@ if sys.stderr is None:
 
 from bridge_core.contract import DEFAULT_LOCAL_IPC_PORT
 from windows.cli import send_ipc_command
+from windows.diagnostics import (
+    DIRECTION_ACTIVE,
+    DIRECTION_OFF,
+    DIRECTION_PAUSED_VOICE,
+    DIRECTION_PROBLEM,
+    DIRECTION_STANDBY,
+    DIRECTION_STOPPED,
+    DIRECTION_WAITING,
+    MODE_DICTATION,
+    MODE_PLAYBACK,
+    OVERALL_ACTION_REQUIRED,
+    OVERALL_CONNECTED,
+    OVERALL_DEGRADED,
+    OVERALL_STOPPED,
+    OVERALL_WAITING_FOR_MAC,
+    ShellState,
+    VOICE_INPUT_ACTIVE,
+    VOICE_INPUT_OFF,
+    VOICE_INPUT_STANDBY,
+    build_diagnostic_report,
+    classify_network_path,
+    get_autostart_status,
+    get_diagnostics_view_data,
+    map_ui_state,
+    open_log_directory,
+)
 
-
-# Overall status constants
-OVERALL_CONNECTED = "Connected"
-OVERALL_WAITING_FOR_MAC = "Waiting for Mac"
-OVERALL_DEGRADED = "Degraded"
-OVERALL_STOPPED = "Stopped"
-OVERALL_ACTION_REQUIRED = "Action required"
-
-# Mode constants
-MODE_PLAYBACK = "Playback"
-MODE_DICTATION = "Dictation"
-
-# Voice input row constants
-VOICE_INPUT_STANDBY = "Automatic / Standby"
-VOICE_INPUT_ACTIVE = "Active"
-VOICE_INPUT_OFF = "Standby / Off"
-
-# Direction row status constants
-DIRECTION_ACTIVE = "Active"
-DIRECTION_WAITING = "Waiting"
-DIRECTION_STOPPED = "Stopped"
-DIRECTION_PROBLEM = "Problem"
-DIRECTION_OFF = "Off"
-DIRECTION_STANDBY = "Standby"
-DIRECTION_PAUSED_VOICE = "Paused for voice input"
-
-
-@dataclass
-class ShellState:
-    """Represents user-facing mapped status for the Product Shell."""
-    overall: str
-    speaker: str
-    microphone: str
-    mode: str = MODE_PLAYBACK
-    voice_input: str = VOICE_INPUT_STANDBY
-    actionable_error: Optional[str] = None
-    raw_status: Optional[Dict[str, Any]] = None
-
-
-def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
-    """Pure mapping function translating controller status into user-facing UI state.
-    
-    Guarantees that raw internal enums/PIDs/IPs are never exposed directly,
-    and maps failure/unavailable states into clear semantic indicators.
-    """
-    if status_dict is None:
-        return ShellState(
-            overall=OVERALL_ACTION_REQUIRED,
-            speaker=DIRECTION_STOPPED,
-            microphone=DIRECTION_STOPPED,
-            mode=MODE_PLAYBACK,
-            voice_input=VOICE_INPUT_OFF,
-            actionable_error="Background service is not running",
-            raw_status=None,
-        )
-
-    desired_state = status_dict.get("desired_state")
-    controller_state = status_dict.get("controller_state")
-    peer_available = bool(status_dict.get("peer_available", False))
-    spk_state = status_dict.get("speaker_path_state")
-    mic_state = status_dict.get("microphone_path_state")
-
-    # Mode determination
-    has_explicit_mode = "mode" in status_dict
-    raw_mode = (status_dict.get("mode") or "").upper()
-    if raw_mode == "DICTATION" or (not has_explicit_mode and mic_state == "RUNNING" and spk_state != "RUNNING"):
-        current_mode = MODE_DICTATION
-    else:
-        current_mode = MODE_PLAYBACK
-
-    # Collect actionable errors
-    spk_err = status_dict.get("last_actionable_error")
-    mic_err = status_dict.get("last_actionable_microphone_error")
-    errors = [e for e in [spk_err, mic_err] if e]
-    actionable_error = "\n".join(errors) if errors else None
-
-    # Explicit user stop overrides active state
-    if desired_state == "STOPPED_BY_USER" or controller_state == "STOPPED":
-        return ShellState(
-            overall=OVERALL_STOPPED,
-            speaker=DIRECTION_STOPPED,
-            microphone=DIRECTION_STOPPED,
-            mode=MODE_PLAYBACK,
-            voice_input=VOICE_INPUT_OFF,
-            actionable_error=actionable_error,
-            raw_status=status_dict,
-        )
-
-    # Voice input status
-    if current_mode == MODE_DICTATION:
-        voice_input = VOICE_INPUT_ACTIVE
-    else:
-        voice_input = VOICE_INPUT_STANDBY
-
-    # Map speaker direction row
-    if spk_state in ("UNAVAILABLE", "FAILED"):
-        speaker_row = DIRECTION_PROBLEM
-    elif current_mode == MODE_DICTATION and mic_state == "RUNNING":
-        speaker_row = DIRECTION_PAUSED_VOICE
-    elif spk_state == "RUNNING":
-        speaker_row = DIRECTION_ACTIVE
-    elif spk_state == "STOPPED":
-        speaker_row = DIRECTION_STOPPED
-    else:
-        speaker_row = DIRECTION_WAITING
-
-    # Map microphone direction row
-    if current_mode == MODE_DICTATION:
-        if mic_state == "RUNNING":
-            microphone_row = DIRECTION_ACTIVE
-        elif mic_state in ("UNAVAILABLE", "FAILED"):
-            microphone_row = DIRECTION_PROBLEM
-        elif mic_state == "STOPPED":
-            microphone_row = DIRECTION_STOPPED
-        else:
-            microphone_row = DIRECTION_WAITING
-    else:
-        # In Playback mode: Mac -> PC Microphone is Standby
-        if mic_state in ("UNAVAILABLE", "FAILED"):
-            microphone_row = DIRECTION_PROBLEM
-        elif mic_state == "RUNNING":
-            microphone_row = DIRECTION_ACTIVE
-        elif not has_explicit_mode and not peer_available:
-            microphone_row = DIRECTION_WAITING
-        else:
-            microphone_row = DIRECTION_STANDBY
-
-    # Determine overall status
-    if controller_state == "ERROR" and speaker_row not in (DIRECTION_ACTIVE, DIRECTION_PAUSED_VOICE) and microphone_row != DIRECTION_ACTIVE:
-        overall = OVERALL_ACTION_REQUIRED
-    elif not peer_available:
-        overall = OVERALL_WAITING_FOR_MAC
-    elif (speaker_row in (DIRECTION_ACTIVE, DIRECTION_PAUSED_VOICE)) and microphone_row == DIRECTION_ACTIVE:
-        overall = OVERALL_CONNECTED
-    elif (speaker_row in (DIRECTION_ACTIVE, DIRECTION_PAUSED_VOICE) and microphone_row == DIRECTION_PROBLEM) or \
-         (microphone_row == DIRECTION_ACTIVE and speaker_row == DIRECTION_PROBLEM):
-        overall = OVERALL_DEGRADED
-    elif current_mode == MODE_PLAYBACK and speaker_row == DIRECTION_ACTIVE:
-        overall = OVERALL_CONNECTED
-    elif current_mode == MODE_DICTATION and microphone_row == DIRECTION_ACTIVE:
-        overall = OVERALL_CONNECTED
-    elif speaker_row == DIRECTION_PROBLEM or microphone_row == DIRECTION_PROBLEM:
-        overall = OVERALL_ACTION_REQUIRED
-    elif speaker_row == DIRECTION_WAITING or microphone_row == DIRECTION_WAITING:
-        overall = OVERALL_WAITING_FOR_MAC
-    else:
-        overall = OVERALL_STOPPED
-
-    return ShellState(
-        overall=overall,
-        speaker=speaker_row,
-        microphone=microphone_row,
-        mode=current_mode,
-        voice_input=voice_input,
-        actionable_error=actionable_error,
-        raw_status=status_dict,
-    )
 
 
 
@@ -218,6 +87,9 @@ class ProductShellClient:
     def end_dictation(self) -> Optional[Dict[str, Any]]:
         return send_ipc_command("dictation-end", port=self.port, timeout=3.0)
 
+    def reconcile(self) -> Optional[Dict[str, Any]]:
+        return send_ipc_command("reconcile", port=self.port, timeout=3.0)
+
 
 class ProductShellApp:
     """Tkinter Desktop Window for Cross-Desk Flow."""
@@ -226,6 +98,8 @@ class ProductShellApp:
         self.root = root
         self.client = client or ProductShellClient()
         self._timer_id: Optional[str] = None
+        self._diagnostics_expanded: bool = False
+        self._last_raw_status: Optional[Dict[str, Any]] = None
 
         self._setup_window()
         self._build_ui()
@@ -234,8 +108,8 @@ class ProductShellApp:
 
     def _setup_window(self):
         self.root.title("Cross-Desk Flow")
-        self.root.geometry("460x400")
-        self.root.minsize(420, 370)
+        self.root.geometry("480x420")
+        self.root.minsize(440, 390)
         self.root.configure(bg="#f8fafc")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -412,7 +286,7 @@ class ProductShellApp:
         )
         self.error_label.pack(fill=tk.X)
 
-        # Action Buttons (Start, Stop, Refresh)
+        # Action Buttons (Start, Stop, Diagnostics toggle, Refresh)
         btn_frame = tk.Frame(main_container, bg="#f8fafc")
         btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
 
@@ -448,21 +322,21 @@ class ProductShellApp:
         )
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.dictation_btn = tk.Button(
+        self.diag_toggle_btn = tk.Button(
             btn_frame,
-            text="Start Dictation",
-            font=("Segoe UI", 9, "bold"),
-            bg="#0284c7",
-            fg="#ffffff",
-            activebackground="#0369a1",
-            activeforeground="#ffffff",
+            text="Diagnostics ▼",
+            font=("Segoe UI", 9),
+            bg="#f1f5f9",
+            fg="#334155",
+            activebackground="#e2e8f0",
+            activeforeground="#1e293b",
             relief=tk.FLAT,
-            padx=14,
+            padx=10,
             pady=6,
             cursor="hand2",
-            command=self.on_dictation_toggle,
+            command=self.on_toggle_diagnostics,
         )
-        self.dictation_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.diag_toggle_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.refresh_btn = tk.Button(
             btn_frame,
@@ -479,6 +353,134 @@ class ProductShellApp:
             command=self.on_refresh,
         )
         self.refresh_btn.pack(side=tk.RIGHT)
+
+        # Diagnostics Collapsible Container
+        self.diag_frame = tk.Frame(
+            main_container,
+            bg="#ffffff",
+            bd=1,
+            relief=tk.SOLID,
+            highlightbackground="#cbd5e1",
+            highlightthickness=1,
+            padx=12,
+            pady=10,
+        )
+        # Note: diag_frame is packed/unpacked dynamically via on_toggle_diagnostics
+
+        diag_header = tk.Label(
+            self.diag_frame,
+            text="DIAGNOSTICS & RECOVERY",
+            font=("Segoe UI", 8, "bold"),
+            fg="#64748b",
+            bg="#ffffff",
+            anchor="w",
+        )
+        diag_header.pack(fill=tk.X, pady=(0, 6))
+
+        # Grid of diagnostic items
+        diag_grid = tk.Frame(self.diag_frame, bg="#ffffff")
+        diag_grid.pack(fill=tk.X, pady=(0, 8))
+        diag_grid.columnconfigure(1, weight=1)
+
+        def make_row(parent, row_idx, label_text):
+            lbl = tk.Label(
+                parent,
+                text=label_text,
+                font=("Segoe UI", 8, "normal"),
+                fg="#475569",
+                bg="#ffffff",
+                anchor="w",
+            )
+            lbl.grid(row=row_idx, column=0, sticky="w", pady=1)
+            val = tk.Label(
+                parent,
+                text="—",
+                font=("Segoe UI", 8, "bold"),
+                fg="#0f172a",
+                bg="#ffffff",
+                anchor="e",
+            )
+            val.grid(row=row_idx, column=1, sticky="e", pady=1)
+            return val
+
+        self.diag_service_val = make_row(diag_grid, 0, "Background Service:")
+        self.diag_peer_val = make_row(diag_grid, 1, "Peer Connectivity:")
+        self.diag_net_val = make_row(diag_grid, 2, "Network Path:")
+        self.diag_autostart_val = make_row(diag_grid, 3, "Auto Start:")
+        self.diag_pack43_val = make_row(diag_grid, 4, "Pack43 Readiness:")
+        self.diag_spk_val = make_row(diag_grid, 5, "Speaker Path:")
+        self.diag_mic_val = make_row(diag_grid, 6, "Microphone Path:")
+        self.diag_voice_val = make_row(diag_grid, 7, "Voice Input:")
+        self.diag_err_val = make_row(diag_grid, 8, "Last Error:")
+
+        # Diagnostic Action Buttons
+        diag_actions = tk.Frame(self.diag_frame, bg="#ffffff")
+        diag_actions.pack(fill=tk.X, pady=(4, 0))
+
+        self.reconcile_btn = tk.Button(
+            diag_actions,
+            text="Restart / Reconcile",
+            font=("Segoe UI", 8, "bold"),
+            bg="#e0f2fe",
+            fg="#0369a1",
+            activebackground="#bae6fd",
+            activeforeground="#0369a1",
+            relief=tk.FLAT,
+            padx=6,
+            pady=4,
+            cursor="hand2",
+            command=self.on_reconcile,
+        )
+        self.reconcile_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.open_logs_btn = tk.Button(
+            diag_actions,
+            text="Open Logs",
+            font=("Segoe UI", 8),
+            bg="#f1f5f9",
+            fg="#334155",
+            activebackground="#e2e8f0",
+            activeforeground="#1e293b",
+            relief=tk.FLAT,
+            padx=6,
+            pady=4,
+            cursor="hand2",
+            command=self.on_open_logs,
+        )
+        self.open_logs_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.copy_report_btn = tk.Button(
+            diag_actions,
+            text="Copy Report",
+            font=("Segoe UI", 8),
+            bg="#f1f5f9",
+            fg="#334155",
+            activebackground="#e2e8f0",
+            activeforeground="#1e293b",
+            relief=tk.FLAT,
+            padx=6,
+            pady=4,
+            cursor="hand2",
+            command=self.on_copy_report,
+        )
+        self.copy_report_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        # Advanced / Manual Dictation override inside Diagnostics
+        self.dictation_btn = tk.Button(
+            diag_actions,
+            text="Start Dictation",
+            font=("Segoe UI", 8, "bold"),
+            bg="#f1f5f9",
+            fg="#0284c7",
+            activebackground="#e0f2fe",
+            activeforeground="#0369a1",
+            relief=tk.FLAT,
+            padx=6,
+            pady=4,
+            cursor="hand2",
+            command=self.on_dictation_toggle,
+        )
+        self.dictation_btn.pack(side=tk.RIGHT)
 
     def _get_badge_colors(self, status: str):
         """Returns (foreground, background) for a given status string."""
@@ -501,6 +503,7 @@ class ProductShellApp:
     def refresh(self):
         """Fetches latest status from IPC client and updates the surface."""
         raw_status = self.client.get_status()
+        self._last_raw_status = raw_status
         state = map_ui_state(raw_status)
 
         # Update overall status
@@ -529,14 +532,18 @@ class ProductShellApp:
         if state.mode == MODE_DICTATION:
             self.dictation_btn.config(
                 text="End Dictation",
-                bg="#dc2626",
-                activebackground="#b91c1c",
+                bg="#fef2f2",
+                fg="#b91c1c",
+                activebackground="#fee2e2",
+                activeforeground="#991b1b",
             )
         else:
             self.dictation_btn.config(
                 text="Start Dictation",
-                bg="#0284c7",
-                activebackground="#0369a1",
+                bg="#f1f5f9",
+                fg="#0284c7",
+                activebackground="#e0f2fe",
+                activeforeground="#0369a1",
             )
 
         # Update actionable error notice
@@ -545,6 +552,60 @@ class ProductShellApp:
             self.error_frame.pack(fill=tk.X, pady=(0, 8), before=self.start_btn.master)
         else:
             self.error_frame.pack_forget()
+
+        # Update diagnostics panel if expanded
+        if self._diagnostics_expanded:
+            self._update_diagnostics_view(raw_status)
+
+    def _update_diagnostics_view(self, status_dict: Optional[Dict[str, Any]]):
+        """Updates diagnostic key-value fields from raw controller status."""
+        data = get_diagnostics_view_data(status_dict)
+        self.diag_service_val.config(text=data["service"][0], fg=data["service"][1])
+        self.diag_peer_val.config(text=data["peer"][0], fg=data["peer"][1])
+        self.diag_net_val.config(text=data["net"][0], fg=data["net"][1])
+        self.diag_autostart_val.config(text=data["autostart"][0], fg=data["autostart"][1])
+        self.diag_pack43_val.config(text=data["pack43"][0], fg=data["pack43"][1])
+        self.diag_spk_val.config(text=data["spk"][0], fg=data["spk"][1])
+        self.diag_mic_val.config(text=data["mic"][0], fg=data["mic"][1])
+        self.diag_voice_val.config(text=data["voice"][0], fg=data["voice"][1])
+        self.diag_err_val.config(text=data["err"][0], fg=data["err"][1])
+
+    def on_toggle_diagnostics(self):
+        """Toggles visibility of the Diagnostics & Recovery panel."""
+        self._diagnostics_expanded = not self._diagnostics_expanded
+        if self._diagnostics_expanded:
+            self.diag_toggle_btn.config(text="Diagnostics ▲")
+            self.diag_frame.pack(fill=tk.X, pady=(0, 10), before=self.start_btn.master)
+            self.root.geometry("480x680")
+            self._update_diagnostics_view(self._last_raw_status)
+        else:
+            self.diag_toggle_btn.config(text="Diagnostics ▼")
+            self.diag_frame.pack_forget()
+            self.root.geometry("480x420")
+
+    def on_reconcile(self):
+        """Sends reconcile or start command to safely restore/restart bridge paths."""
+        if self._last_raw_status is not None:
+            self.client.reconcile()
+        else:
+            self.client.start()
+        self.refresh()
+
+    def on_open_logs(self):
+        """Opens log directory in Windows File Explorer."""
+        open_log_directory()
+
+    def on_copy_report(self):
+        """Generates sanitized diagnostic report and copies to system clipboard."""
+        report = build_diagnostic_report(self._last_raw_status)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report)
+            old_text = self.copy_report_btn.cget("text")
+            self.copy_report_btn.config(text="Copied!")
+            self.root.after(1500, lambda: self.copy_report_btn.config(text=old_text))
+        except Exception:
+            pass
 
     def on_dictation_toggle(self):
         """IPC dictation start/end toggle callback."""
