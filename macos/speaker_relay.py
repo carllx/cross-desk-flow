@@ -7,7 +7,7 @@ the canonical GStreamer osxaudiosink receiver.
 Dynamically scales big-endian 16-bit linear PCM audio samples in-place
 without restarting or interrupting the GStreamer media pipeline:
 - Volume 1.0 (100%): Direct zero-copy passthrough.
-- Volume 0.0 (0% / Mute): Drops packet, achieving absolute mute with zero CPU work.
+- Volume 0.0 (0% / Mute): Zeros out PCM payload preserving RTP framing and headers without dropping packets.
 - Volume 0.0 < V < 1.0: Vectorized sample scaling using numpy or struct.
 """
 
@@ -56,6 +56,11 @@ class SpeakerVolumeRelay:
         with self._lock:
             return self._volume
 
+    @property
+    def is_running(self) -> bool:
+        """Returns True if the relay thread and incoming socket are actively running."""
+        return self._running and self._thread is not None and self._thread.is_alive()
+
     def set_volume(self, vol: float) -> None:
         """Sets volume factor between 0.0 and 1.0 atomically."""
         clamped = max(0.0, min(1.0, float(vol)))
@@ -70,20 +75,7 @@ class SpeakerVolumeRelay:
         try:
             s_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, "SO_REUSEPORT"):
-                try:
-                    s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                except Exception:
-                    pass
-            try:
-                s_in.bind((self.bind_ip, self.listen_port))
-            except OSError as e:
-                # In unit tests with mock discovery IPs (e.g. 192.168.x.x not on host),
-                # fallback to 127.0.0.1 so test runner sockets remain functional
-                if self.bind_ip != "127.0.0.1":
-                    s_in.bind(("127.0.0.1", self.listen_port))
-                else:
-                    raise e
+            s_in.bind((self.bind_ip, self.listen_port))
             s_in.settimeout(0.2)
             self._in_sock = s_in
 

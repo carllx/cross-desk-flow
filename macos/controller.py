@@ -155,6 +155,8 @@ class MacBridgeController:
 
     def _stop_child(self, role: str) -> bool:
         """Stops an owned child process, confirms its death, and updates journal."""
+        if role == "speaker":
+            self.voice_ducking.stop_relay()
         pid = self._speaker_child_pid if role == "speaker" else self._microphone_child_pid
         if pid is None:
             return True
@@ -186,7 +188,6 @@ class MacBridgeController:
 
         if role == "speaker":
             self._speaker_child_pid = None
-            self.voice_ducking.stop_relay()
         else:
             self._microphone_child_pid = None
         return True
@@ -533,11 +534,15 @@ class MacBridgeController:
             self._speaker_path_state = PathState.FAILED
             return
 
-        # Verify if speaker pipeline already running
+        # Verify if speaker pipeline and relay are healthy and running
         if self._speaker_child_pid and self.process_runner.is_running(self._speaker_child_pid):
-            self._controller_state = LifecycleState.ACTIVE
-            self._speaker_path_state = PathState.RUNNING
-            return
+            if self.voice_ducking.is_relay_running:
+                self._controller_state = LifecycleState.ACTIVE
+                self._speaker_path_state = PathState.RUNNING
+                return
+            # Child is alive but relay absent/dead: rebuild through lifecycle seam without duplicate children
+            if not self._stop_child("speaker"):
+                return
 
         # Determine local bind address
         local_bind = self.discovery_service.local_bind_address
@@ -580,10 +585,7 @@ class MacBridgeController:
                 else:
                     self._speaker_path_state = PathState.FAILED
                     self._controller_state = LifecycleState.ERROR
-                    err_msg = (
-                        f"Failed to atomically record speaker child in ownership journal, and "
-                        f"spawned child [PID {pid}] cleanup could not be confirmed"
-                    )
+                    err_msg = f"Failed to atomically record speaker child in ownership journal, and spawned child [PID {pid}] cleanup could not be confirmed"
                     self._last_actionable_error = err_msg
                     logger.error(err_msg)
                 return
@@ -677,10 +679,7 @@ class MacBridgeController:
                 else:
                     self._microphone_path_state = PathState.FAILED
                     self._controller_state = LifecycleState.ERROR
-                    err_msg = (
-                        f"Failed to atomically record microphone child in ownership journal, and "
-                        f"spawned child [PID {pid}] cleanup could not be confirmed"
-                    )
+                    err_msg = f"Failed to atomically record microphone child in ownership journal, and spawned child [PID {pid}] cleanup could not be confirmed"
                     self._last_actionable_microphone_error = err_msg
                     logger.error(err_msg)
                 return

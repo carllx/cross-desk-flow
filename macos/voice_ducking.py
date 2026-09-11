@@ -308,6 +308,11 @@ class VoiceDuckingController:
             self.relay.set_volume(target_vol)
         return target_vol
 
+    @property
+    def is_relay_running(self) -> bool:
+        """Returns True if speaker volume relay exists and is running."""
+        return self.relay is not None and self.relay.is_running
+
     def start_relay(self, bind_ip: str, listen_port: int, target_port: int) -> bool:
         """Starts or reconfigures the speaker volume relay proxy."""
         from .speaker_relay import SpeakerVolumeRelay
@@ -317,7 +322,7 @@ class VoiceDuckingController:
                 self.relay.bind_ip == bind_ip
                 and self.relay.listen_port == listen_port
                 and self.relay.target_port == target_port
-                and self.relay._running
+                and self.relay.is_running
             ):
                 self.recalculate_and_apply_volume()
                 return True

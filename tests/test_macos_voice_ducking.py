@@ -26,9 +26,22 @@ import socket
 import struct
 import tempfile
 import time
+import sys
 import pytest
 
-from bridge_core.contract import DesiredState
+# Ensure tests/ directory is in sys.path for importing fixtures
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
+
+from test_macos_controller import (
+    FakeProcessRunner,
+    FakeDeviceResolver,
+    FakeReceiverBuilder,
+    FakeDiscoveryService,
+)
+
+from bridge_core.contract import DesiredState, DEFAULT_SPEAKER_INTERNAL_RTP_PORT
 from macos.voice_ducking import (
     DEFAULT_DUCK_LEVEL,
     VoiceDuckingSettings,
@@ -385,26 +398,6 @@ def test_controller_speaker_relay_integration(tmp_path):
     - Stopping controller cleanly stops the relay socket/thread
     """
     from macos.controller import MacBridgeController
-    from bridge_core.contract import DEFAULT_SPEAKER_INTERNAL_RTP_PORT
-    try:
-        from tests.test_macos_controller import (
-            FakeProcessRunner,
-            FakeDeviceResolver,
-            FakeReceiverBuilder,
-            FakeDiscoveryService,
-        )
-    except ModuleNotFoundError:
-        import sys
-        tests_dir = os.path.dirname(os.path.abspath(__file__))
-        if tests_dir not in sys.path:
-            sys.path.insert(0, tests_dir)
-        from test_macos_controller import (
-            FakeProcessRunner,
-            FakeDeviceResolver,
-            FakeReceiverBuilder,
-            FakeDiscoveryService,
-        )
-
     state_file = str(tmp_path / "controller_state.json")
     journal_file = str(tmp_path / "ownership_journal.json")
 
@@ -467,3 +460,135 @@ def test_controller_speaker_relay_integration(tmp_path):
 
     finally:
         controller.shutdown()
+
+
+# ---------------------------------------------------------
+# 10. Focused Tests for #46 Narrow Corrections
+# ---------------------------------------------------------
+
+def test_relay_bind_failure_returns_false_without_fallback():
+    """Verify SpeakerVolumeRelay.start() fails and returns False when binding requested
+    local_bind fails, with no fallback to 127.0.0.1.
+    """
+    # 240.0.0.1 is a reserved/unassignable IPv4 address on macOS
+    relay = SpeakerVolumeRelay(
+        bind_ip="240.0.0.1",
+        listen_port=59990,
+        target_port=59991,
+    )
+    result = relay.start()
+    assert result is False
+    assert relay.is_running is False
+    assert relay._in_sock is None
+
+
+def test_relay_exclusive_binding_prevents_duplicate():
+    """Verify exclusive socket binding (no SO_REUSEPORT) prevents a second relay on same address/port."""
+    s_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s_probe.bind(("127.0.0.1", 0))
+    port = s_probe.getsockname()[1]
+    s_probe.close()
+
+    relay1 = SpeakerVolumeRelay(
+        bind_ip="127.0.0.1",
+        listen_port=port,
+        target_port=port + 1,
+    )
+    assert relay1.start() is True
+    assert relay1.is_running is True
+
+    try:
+        relay2 = SpeakerVolumeRelay(
+            bind_ip="127.0.0.1",
+            listen_port=port,
+            target_port=port + 2,
+        )
+        assert relay2.start() is False
+        assert relay2.is_running is False
+    finally:
+        relay1.stop()
+
+
+def test_speaker_health_requires_child_and_relay(tmp_path):
+    """Verify _reconcile_speaker() treats speaker as healthy only when both child and relay
+    are running; recovers cleanly without duplicate children if relay dies.
+    """
+    from macos.controller import MacBridgeController
+    from bridge_core.contract import PathState, LifecycleState
+
+    runner = FakeProcessRunner()
+    pipeline_builder = FakeReceiverBuilder()
+    discovery = FakeDiscoveryService(peer_available=True, local_bind="127.0.0.1")
+
+    controller = MacBridgeController(
+        state_file=str(tmp_path / "ctrl.json"),
+        journal_file=str(tmp_path / "journal.json"),
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=pipeline_builder,
+        discovery_service=discovery,
+        lock_port=0,
+        ipc_port=0,
+    )
+
+    try:
+        assert controller.start() is True
+        status = controller.get_status()
+        assert status.speaker_path_state == PathState.RUNNING.value
+        assert controller.voice_ducking.is_relay_running is True
+        initial_child_pid = controller._speaker_child_pid
+        assert initial_child_pid is not None
+        assert initial_child_pid in runner.running_pids
+
+        # Simulate relay unexpectedly stopped while child is still alive
+        controller.voice_ducking.stop_relay()
+        assert controller.voice_ducking.is_relay_running is False
+        assert runner.is_running(initial_child_pid) is True
+
+        # Reconcile must recover via existing seam (_stop_child) and rebuild cleanly
+        controller.reconcile()
+        assert initial_child_pid in runner.stopped_pids
+        new_child_pid = controller._speaker_child_pid
+        assert new_child_pid is not None
+        assert new_child_pid != initial_child_pid
+        assert runner.is_running(new_child_pid) is True
+        assert controller.voice_ducking.is_relay_running is True
+        assert controller.get_status().speaker_path_state == PathState.RUNNING.value
+        assert len(runner.running_pids) == 1
+    finally:
+        controller.shutdown()
+
+
+def test_stop_child_cleans_relay_when_speaker_pid_is_none(tmp_path):
+    """Verify _stop_child('speaker') stops relay even when _speaker_child_pid is None (no orphan relay)."""
+    from macos.controller import MacBridgeController
+
+    controller = MacBridgeController(
+        state_file=str(tmp_path / "ctrl.json"),
+        journal_file=str(tmp_path / "journal.json"),
+        process_runner=FakeProcessRunner(),
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=FakeReceiverBuilder(),
+        discovery_service=FakeDiscoveryService(peer_available=False, local_bind="127.0.0.1"),
+        lock_port=0,
+        ipc_port=0,
+    )
+
+    try:
+        # Start a relay independently without setting _speaker_child_pid
+        s_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s_probe.bind(("127.0.0.1", 0))
+        port = s_probe.getsockname()[1]
+        s_probe.close()
+
+        assert controller.voice_ducking.start_relay("127.0.0.1", port, port + 1) is True
+        assert controller.voice_ducking.is_relay_running is True
+        assert controller._speaker_child_pid is None
+
+        # Calling _stop_child("speaker") must stop relay
+        assert controller._stop_child("speaker") is True
+        assert controller.voice_ducking.is_relay_running is False
+        assert controller.voice_ducking.relay is None
+    finally:
+        controller.shutdown()
+
