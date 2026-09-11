@@ -102,6 +102,10 @@ class LocalControlServer:
                         "success": success,
                         "microphone_path_state": self.controller.get_status().microphone_path_state,
                     }
+                elif cmd == "set-duck-level":
+                    level = req.get("level", 20)
+                    saved = self.controller.set_duck_level(int(level))
+                    res = {"success": True, "duck_level": saved}
                 else:
                     res = {"error": f"Unknown command {cmd}"}
 

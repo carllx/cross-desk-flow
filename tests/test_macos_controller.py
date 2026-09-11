@@ -207,14 +207,14 @@ def test_repeated_start_is_idempotent_and_creates_single_receiver(temp_state_fil
     status1 = controller.get_status()
     assert status1.desired_state == DesiredState.ENABLED.value
     assert status1.speaker_path_state == PathState.RUNNING.value
-    assert status1.microphone_path_state == PathState.RUNNING.value
-    assert len(runner.started_commands) == 2
+    assert status1.microphone_path_state == PathState.IDLE.value
+    assert len(runner.started_commands) == 1
 
     assert controller.start() is True
     status2 = controller.get_status()
     assert status2.desired_state == DesiredState.ENABLED.value
-    assert len(runner.started_commands) == 2
-    assert status2.owned_children_count == 2
+    assert len(runner.started_commands) == 1
+    assert status2.owned_children_count == 1
 
     controller.shutdown()
 
@@ -232,7 +232,7 @@ def test_repeated_stop_is_idempotent_and_cleans_owned_process(temp_state_file):
     )
 
     controller.start()
-    assert len(runner.running_pids) == 2
+    assert len(runner.running_pids) == 1
 
     assert controller.stop() is True
     status1 = controller.get_status()
@@ -552,12 +552,12 @@ def test_macos_cross_process_ipc_lifecycle(temp_state_file):
     assert res_status is not None
     assert res_status["desired_state"] == DesiredState.ENABLED.value
     assert res_status["role"] == HostRole.MACOS.value
-    assert res_status["owned_children_count"] == 2
+    assert res_status["owned_children_count"] == 1
 
     res_start = send_ipc_command("start", port=ipc_port)
     assert res_start is not None
     assert res_start["success"] is True
-    assert len(runner.started_commands) == 2
+    assert len(runner.started_commands) == 1
 
     res_stop = send_ipc_command("stop", port=ipc_port)
     assert res_stop is not None

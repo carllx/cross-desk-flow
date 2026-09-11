@@ -223,7 +223,7 @@ def test_sender_canonical_rtp_command_format():
 # ---------------------------------------------------------
 
 def test_microphone_auto_starts_on_enabled_with_peer(temp_state_file):
-    """Under pre-#22 dual-active policy, microphone automatically starts when controller starts and peer is online."""
+    """Under Issue #43 on-demand policy, microphone is IDLE/Standby on controller start until requested."""
     runner = FakeProcessRunner()
     resolver = FakeDeviceResolver()
     disc = FakeDiscoveryService()
@@ -240,9 +240,9 @@ def test_microphone_auto_starts_on_enabled_with_peer(temp_state_file):
     st = ctrl.get_status()
     assert st.controller_state == LifecycleState.ACTIVE.value
     assert st.speaker_path_state == PathState.RUNNING.value
-    assert st.microphone_path_state == PathState.RUNNING.value
-    assert st.owned_children_count == 2
-    assert ctrl._microphone_child_pid is not None
+    assert st.microphone_path_state == PathState.IDLE.value
+    assert st.owned_children_count == 1
+    assert ctrl._microphone_child_pid is None
     ctrl.shutdown()
 
 
@@ -260,8 +260,8 @@ def test_microphone_not_started_when_stopped_by_user(temp_state_file):
         process_runner=runner,
         device_resolver=resolver,
         discovery_service=disc,
-        lock_port=50312,
-        ipc_port=50313,
+        lock_port=50360,
+        ipc_port=50361,
     )
     assert ctrl.start_host() is True
 
@@ -276,7 +276,7 @@ def test_microphone_not_started_when_stopped_by_user(temp_state_file):
 
 
 def test_reboot_persisted_enabled_restores_microphone_intent(temp_state_file):
-    """When persisted desired state is ENABLED, start_host automatically restores microphone desired intent and runs mic."""
+    """When persisted desired state is ENABLED, start_host defaults to Playback mode with mic in IDLE/Standby."""
     runner = FakeProcessRunner()
     resolver = FakeDeviceResolver()
     disc = FakeDiscoveryService()
@@ -293,21 +293,21 @@ def test_reboot_persisted_enabled_restores_microphone_intent(temp_state_file):
         ipc_port=50351,
     )
     assert ctrl.start_host() is True
-    assert ctrl._microphone_desired is True
+    assert ctrl._microphone_desired is False
 
     st = ctrl.get_status()
     assert st.desired_state == DesiredState.ENABLED.value
     assert st.controller_state == LifecycleState.ACTIVE.value
     assert st.speaker_path_state == PathState.RUNNING.value
-    assert st.microphone_path_state == PathState.RUNNING.value
-    assert st.owned_children_count == 2
+    assert st.microphone_path_state == PathState.IDLE.value
+    assert st.owned_children_count == 1
     assert ctrl._speaker_child_pid is not None
-    assert ctrl._microphone_child_pid is not None
+    assert ctrl._microphone_child_pid is None
     ctrl.shutdown()
 
 
 def test_reboot_persisted_enabled_with_mic_permission_denied_fails_closed(temp_state_file):
-    """When persisted desired state is ENABLED but mic permission is Denied, microphone fails closed while speaker remains ACTIVE."""
+    """When persisted desired state is ENABLED, if mic is subsequently enabled but permission is Denied, mic fails closed while speaker remains ACTIVE."""
     runner = FakeProcessRunner()
     resolver = FakeDeviceResolver()
     disc = FakeDiscoveryService()
@@ -326,15 +326,23 @@ def test_reboot_persisted_enabled_with_mic_permission_denied_fails_closed(temp_s
         ipc_port=50353,
     )
     assert ctrl.start_host() is True
-    assert ctrl._microphone_desired is True
+    assert ctrl._microphone_desired is False
 
     st = ctrl.get_status()
     assert st.desired_state == DesiredState.ENABLED.value
     assert st.speaker_path_state == PathState.RUNNING.value
-    assert st.microphone_path_state == PathState.FAILED.value
-    assert "Microphone permission denied" in (st.last_actionable_microphone_error or "")
+    assert st.microphone_path_state == PathState.IDLE.value
     assert st.owned_children_count == 1
     assert ctrl._speaker_child_pid is not None
+    assert ctrl._microphone_child_pid is None
+
+    # Now explicitly enable mic: it must fail closed due to denied permission
+    ctrl.set_microphone_enabled(True)
+    st_after = ctrl.get_status()
+    assert st_after.speaker_path_state == PathState.RUNNING.value
+    assert st_after.microphone_path_state == PathState.FAILED.value
+    assert "Microphone permission denied" in (st_after.last_actionable_microphone_error or "")
+    assert st_after.owned_children_count == 1
     assert ctrl._microphone_child_pid is None
     ctrl.shutdown()
 
@@ -371,7 +379,7 @@ def test_explicit_microphone_enable_and_disable_idempotence(temp_state_file):
     # Disable microphone
     ok3 = ctrl.set_microphone_enabled(False)
     assert ok3 is True
-    assert ctrl.get_status().microphone_path_state == PathState.STOPPED.value
+    assert ctrl.get_status().microphone_path_state == PathState.IDLE.value
     assert ctrl.get_status().owned_children_count == 1
     assert mic_pid in runner.stopped_pids
     assert ctrl._microphone_child_pid is None
@@ -379,7 +387,7 @@ def test_explicit_microphone_enable_and_disable_idempotence(temp_state_file):
     # Repeated disable is safe
     ok4 = ctrl.set_microphone_enabled(False)
     assert ok4 is True
-    assert ctrl.get_status().microphone_path_state == PathState.STOPPED.value
+    assert ctrl.get_status().microphone_path_state == PathState.IDLE.value
     ctrl.shutdown()
 
 
@@ -555,13 +563,10 @@ def test_speaker_receiver_unaffected_by_microphone_failure(temp_state_file):
     ctrl.start()
     assert ctrl.get_status().speaker_path_state == PathState.RUNNING.value
     spk_pid = ctrl._speaker_child_pid
-    # Under pre-#22 dual-active, mic started running on ctrl.start()
-    assert ctrl.get_status().microphone_path_state == PathState.RUNNING.value
-    # Disable first
-    ctrl.set_microphone_enabled(False)
-    assert ctrl.get_status().microphone_path_state == PathState.STOPPED.value
+    # Under Issue #43 on-demand policy, mic defaults to IDLE on ctrl.start()
+    assert ctrl.get_status().microphone_path_state == PathState.IDLE.value
 
-    # Now simulate mic resolution failure and re-enable
+    # Now simulate mic resolution failure and enable
     resolver.fail_mic = True
     ok = ctrl.set_microphone_enabled(True)
     assert ok is False

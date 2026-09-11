@@ -79,6 +79,8 @@ class MacDictationResponder:
                     c._microphone_child_pid = None
 
                 self.current_dictation_session = session_id
+                if hasattr(c, "voice_ducking"):
+                    c.voice_ducking.recalculate_and_apply_volume()
                 ok = c.set_microphone_enabled(True)
                 status = c.get_status()
                 c.discovery_service.send_control_message(
@@ -96,8 +98,10 @@ class MacDictationResponder:
                 )
 
             elif msg_type == "DICTATION_STOP":
-                c.set_microphone_enabled(False)
                 self.current_dictation_session = None
+                if hasattr(c, "voice_ducking"):
+                    c.voice_ducking.recalculate_and_apply_volume()
+                c.set_microphone_enabled(False)
                 c.discovery_service.send_control_message(
                     peer_ip,
                     {
