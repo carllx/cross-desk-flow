@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import subprocess
 import sys
+import time
 from typing import Any, Dict, Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +24,25 @@ if REPO_ROOT not in sys.path:
 from dataclasses import dataclass
 
 from bridge_core.interface_classifier import InterfaceClassifier, InterfaceMedium
+
+
+_PATH_REGEX = re.compile(r"[a-zA-Z]:\\[^\s,;'\"]+")
+_GUID_REGEX = re.compile(r"\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?")
+_CREDENTIAL_REGEX = re.compile(r"(?i)\b(password|token|secret|key|credential)\s*[:=]\s*[^\s,;'\"]+")
+
+
+def sanitize_diagnostic_text(text: Optional[str]) -> str:
+    """Sanitizes diagnostic text by redacting absolute paths, GUIDs, and credential key-values.
+    
+    Preserves meaningful diagnostic errors while preventing accidental leakage of
+    local username paths, hardware GUIDs, or secret tokens.
+    """
+    if not text:
+        return ""
+    sanitized = _CREDENTIAL_REGEX.sub(r"\1=<redacted>", text)
+    sanitized = _PATH_REGEX.sub("<path redacted>", sanitized)
+    sanitized = _GUID_REGEX.sub("<guid redacted>", sanitized)
+    return sanitized
 
 
 # Overall status constants
@@ -182,6 +203,11 @@ def map_ui_state(status_dict: Optional[Dict[str, Any]]) -> ShellState:
     )
 
 
+_shared_classifier: Optional[InterfaceClassifier] = None
+_cached_network_path: Dict[str, tuple[str, float]] = {}
+_cached_autostart: tuple[str, float] = ("", 0.0)
+
+
 def get_log_directory() -> str:
     """Returns the canonical Windows log and state directory."""
     local_app_data = os.environ.get("LOCALAPPDATA")
@@ -190,8 +216,19 @@ def get_log_directory() -> str:
     return os.path.join(os.path.expanduser("~"), "AppData", "Local", "desk-audio-bridge")
 
 
-def open_log_directory() -> bool:
-    """Opens the log directory in Windows File Explorer safely."""
+def has_log_files() -> bool:
+    """Checks whether any .log files exist in the log directory."""
+    log_dir = get_log_directory()
+    if not os.path.isdir(log_dir):
+        return False
+    try:
+        return any(f.endswith(".log") for f in os.listdir(log_dir))
+    except Exception:
+        return False
+
+
+def open_data_directory() -> bool:
+    """Opens the data/state directory in Windows File Explorer safely."""
     log_dir = get_log_directory()
     os.makedirs(log_dir, exist_ok=True)
     try:
@@ -204,35 +241,105 @@ def open_log_directory() -> bool:
         return False
 
 
-def classify_network_path(local_bind: Optional[str], classifier: Optional[InterfaceClassifier] = None) -> str:
-    """Classifies network route for local binding address.
+# Compatibility alias
+open_log_directory = open_data_directory
+
+
+def classify_network_path(
+    local_bind: Optional[str],
+    classifier: Optional[InterfaceClassifier] = None,
+    force_probe: bool = False,
+) -> str:
+    """Classifies network route for local binding address with TTL caching.
     
     Returns one of: 'Ethernet', 'Wi-Fi', 'Fallback (other)', or 'Unknown'.
     """
     if not local_bind or local_bind in ("0.0.0.0", "127.0.0.1"):
         return "Unknown"
-    cls = classifier or InterfaceClassifier()
+
+    now = time.time()
+    if not force_probe and local_bind in _cached_network_path:
+        val, ts = _cached_network_path[local_bind]
+        if now - ts < 30.0:
+            return val
+
+    global _shared_classifier
+    if classifier is not None:
+        cls = classifier
+    else:
+        if _shared_classifier is None:
+            _shared_classifier = InterfaceClassifier()
+        cls = _shared_classifier
+
+    result = "Unknown"
     try:
         medium = cls.classify_interface(local_bind)
         if medium == InterfaceMedium.WIRED_ETHERNET:
-            return "Ethernet"
-        if medium == InterfaceMedium.WIFI:
-            return "Wi-Fi"
-        if medium == InterfaceMedium.OTHER:
-            return "Fallback (other)"
+            result = "Ethernet"
+        elif medium == InterfaceMedium.WIFI:
+            result = "Wi-Fi"
+        elif medium == InterfaceMedium.OTHER:
+            result = "Fallback (other)"
     except Exception:
-        pass
-    return "Unknown"
+        result = "Unknown"
+
+    _cached_network_path[local_bind] = (result, now)
+    return result
 
 
-def get_autostart_status() -> str:
-    """Queries current-user Task Scheduler autostart status."""
+def get_autostart_status(force_probe: bool = False) -> str:
+    """Queries current-user Task Scheduler autostart status with TTL caching."""
+    global _cached_autostart
+    now = time.time()
+    if not force_probe and _cached_autostart[0] and (now - _cached_autostart[1] < 30.0):
+        return _cached_autostart[0]
+
     try:
         from windows.task_scheduler import is_scheduled_task_installed
         installed = is_scheduled_task_installed()
-        return "Installed" if installed else "Not installed"
+        status = "Installed" if installed else "Not installed"
     except Exception:
-        return "Unknown"
+        status = "Unknown"
+
+    _cached_autostart = (status, now)
+    return status
+
+
+def start_controller_via_lifecycle(timeout_sec: float = 5.0) -> bool:
+    """Recovers an absent/dead controller using the existing Windows Task Scheduler lifecycle seam.
+    
+    Strict rules:
+    - Never directly spawns controller.py or pythonw.exe from the shell.
+    - Never creates a second lifecycle or broad-kills existing processes.
+    - Invokes the already-registered production Scheduled Task (or installs if missing).
+    - Waits boundedly for the controller to become responsive on IPC.
+    """
+    from windows.cli import send_ipc_command
+    from windows.task_scheduler import (
+        DEFAULT_TASK_NAME,
+        _get_scheduler_folder,
+        install_scheduled_task,
+        is_scheduled_task_installed,
+    )
+
+    if not is_scheduled_task_installed():
+        ok, _ = install_scheduled_task(start_service=True)
+        return ok
+
+    try:
+        folder = _get_scheduler_folder()
+        task = folder.GetTask(DEFAULT_TASK_NAME)
+        task.Run(None)
+    except Exception:
+        return False
+
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        status = send_ipc_command("status")
+        if status is not None and status.get("owner_pid") is not None:
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def get_deployed_sha(repo_root: Optional[str] = None) -> str:
@@ -331,9 +438,9 @@ def build_diagnostic_report(
     mic_error = status_dict.get("last_actionable_microphone_error")
     error_parts = []
     if actionable_error:
-        error_parts.append(str(actionable_error))
+        error_parts.append(sanitize_diagnostic_text(str(actionable_error)))
     if mic_error and mic_error != actionable_error:
-        error_parts.append(str(mic_error))
+        error_parts.append(sanitize_diagnostic_text(str(mic_error)))
     last_error_line = "; ".join(error_parts) if error_parts else "None"
 
     return (
@@ -355,7 +462,10 @@ def build_diagnostic_report(
 
 
 def get_diagnostics_view_data(status_dict: Optional[Dict[str, Any]]) -> Dict[str, tuple[str, str]]:
-    """Extracts display tuples (text, foreground_color) for diagnostics UI fields."""
+    """Extracts display tuples (text, foreground_color) for diagnostics UI fields.
+    
+    Guarantees that UI rows stay clean and user-facing (no raw PIDs or raw IPs in the UI grid).
+    """
     if status_dict is None:
         return {
             "service": ("Not running", "#b91c1c"),
@@ -369,20 +479,18 @@ def get_diagnostics_view_data(status_dict: Optional[Dict[str, Any]]) -> Dict[str
             "err": ("Background service is not running", "#b91c1c"),
         }
 
-    # Background service
-    owner_pid = status_dict.get("owner_pid")
+    # Background service: Clean user-facing text (no raw PID)
     ctrl_state = status_dict.get("controller_state", "RUNNING")
-    if owner_pid:
-        service = (f"Running (PID {owner_pid})", "#15803d")
+    if ctrl_state == "RUNNING" or status_dict.get("owner_pid"):
+        service = ("Running", "#15803d")
+    elif ctrl_state == "STOPPED":
+        service = ("Stopped", "#475569")
     else:
-        service = (ctrl_state, "#15803d" if ctrl_state == "RUNNING" else "#b91c1c")
+        service = (ctrl_state, "#b91c1c")
 
-    # Peer connectivity
+    # Peer connectivity: Clean user-facing text (no raw IP)
     peer_avail = bool(status_dict.get("peer_available", False))
-    peer_addr = status_dict.get("peer_address")
-    if peer_avail and peer_addr:
-        peer = (f"Connected ({peer_addr})", "#15803d")
-    elif peer_avail:
+    if peer_avail:
         peer = ("Connected", "#15803d")
     else:
         peer = ("None", "#b45309")

@@ -263,3 +263,107 @@ def test_build_diagnostic_report_controller_absent():
     assert "Voice Input: Standby / Off" in report
     assert "Last Actionable Error: Background service is not running" in report
 
+
+def test_sanitize_diagnostic_text():
+    """Deterministic verification of path, GUID, and credential redaction."""
+    from windows.diagnostics import sanitize_diagnostic_text
+
+    raw_err = (
+        r"Failed loading DLL at C:\Users\alice\AppData\Local\desk-audio-bridge\lib.dll: "
+        r"Device {12345678-ABCD-EF01-2345-6789ABCDEF01} refused token=secret123 and password: mypass456"
+    )
+    sanitized = sanitize_diagnostic_text(raw_err)
+    assert r"C:\Users\alice" not in sanitized
+    assert "<path redacted>" in sanitized
+    assert "{12345678-ABCD-EF01-2345-6789ABCDEF01}" not in sanitized
+    assert "<guid redacted>" in sanitized
+    assert "secret123" not in sanitized
+    assert "token=<redacted>" in sanitized
+    assert "mypass456" not in sanitized
+    assert "password=<redacted>" in sanitized
+
+
+def test_diagnostics_ui_rows_clean_user_level():
+    """UI grid display values must stay user-level (no raw PIDs or raw IPs)."""
+    from windows.diagnostics import get_diagnostics_view_data
+
+    status = {
+        "controller_state": "RUNNING",
+        "desired_state": "RUNNING",
+        "owner_pid": 98765,
+        "peer_available": True,
+        "peer_address": "192.168.1.100:50105",
+        "local_bind_address": "192.168.1.50",
+        "speaker_path_state": "RUNNING",
+        "microphone_path_state": "RUNNING",
+    }
+    view_data = get_diagnostics_view_data(status)
+    assert view_data["service"][0] == "Running"
+    assert "98765" not in view_data["service"][0]
+    assert view_data["peer"][0] == "Connected"
+    assert "192.168.1.100" not in view_data["peer"][0]
+
+
+def test_dead_controller_recovery_invokes_lifecycle_seam():
+    """When controller is absent, on_reconcile triggers lifecycle start seam, not direct subprocess."""
+    import tkinter as tk
+    from windows.product_shell import ProductShellApp
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        mock_client = MagicMock()
+        mock_client.get_status.return_value = None  # controller absent
+
+        with patch("windows.product_shell.start_controller_via_lifecycle") as mock_start_lifecycle, \
+             patch("subprocess.Popen") as mock_popen, \
+             patch("subprocess.run") as mock_run:
+
+            app = ProductShellApp(root, client=mock_client)
+            assert app._last_raw_status is None
+
+            # Trigger on_reconcile while controller is absent
+            app.on_reconcile()
+
+            # Must invoke lifecycle start seam
+            mock_start_lifecycle.assert_called_once_with(timeout_sec=5.0)
+
+            # Must not call client.reconcile() or client.start() over dead IPC
+            mock_client.reconcile.assert_not_called()
+            mock_client.start.assert_not_called()
+
+            # Must never directly invoke subprocess to spawn pythonw/controller
+            mock_popen.assert_not_called()
+            mock_run.assert_not_called()
+    finally:
+        root.destroy()
+
+
+def test_diagnostics_probe_caching():
+    """classify_network_path and get_autostart_status use cached values without repeated expensive queries."""
+    import time
+    from windows.diagnostics import (
+        _cached_autostart,
+        _cached_network_path,
+        classify_network_path,
+        get_autostart_status,
+    )
+
+    mock_cls = MagicMock()
+    from bridge_core.interface_classifier import InterfaceMedium
+    mock_cls.classify_interface.return_value = InterfaceMedium.WIRED_ETHERNET
+
+    # Clear test cache
+    _cached_network_path.clear()
+
+    # First call probes classifier
+    res1 = classify_network_path("192.168.1.200", classifier=mock_cls)
+    assert res1 == "Ethernet"
+    assert mock_cls.classify_interface.call_count == 1
+
+    # Second call within TTL returns cached value without calling classifier
+    res2 = classify_network_path("192.168.1.200", classifier=mock_cls)
+    assert res2 == "Ethernet"
+    assert mock_cls.classify_interface.call_count == 1
+
+

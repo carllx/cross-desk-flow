@@ -55,8 +55,11 @@ from windows.diagnostics import (
     classify_network_path,
     get_autostart_status,
     get_diagnostics_view_data,
+    has_log_files,
     map_ui_state,
+    open_data_directory,
     open_log_directory,
+    start_controller_via_lifecycle,
 )
 
 
@@ -114,8 +117,8 @@ class ProductShellApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Style configuration
-        self.style = ttk.Style()
         try:
+            self.style = ttk.Style(self.root)
             self.style.theme_use("clam")
         except Exception:
             pass
@@ -435,7 +438,7 @@ class ProductShellApp:
 
         self.open_logs_btn = tk.Button(
             diag_actions,
-            text="Open Logs",
+            text="Open Logs" if has_log_files() else "Open Data Folder",
             font=("Segoe UI", 8),
             bg="#f1f5f9",
             fg="#334155",
@@ -569,6 +572,8 @@ class ProductShellApp:
         self.diag_mic_val.config(text=data["mic"][0], fg=data["mic"][1])
         self.diag_voice_val.config(text=data["voice"][0], fg=data["voice"][1])
         self.diag_err_val.config(text=data["err"][0], fg=data["err"][1])
+        # Dynamically ensure truthful label for logs/data folder button
+        self.open_logs_btn.config(text="Open Logs" if has_log_files() else "Open Data Folder")
 
     def on_toggle_diagnostics(self):
         """Toggles visibility of the Diagnostics & Recovery panel."""
@@ -584,16 +589,23 @@ class ProductShellApp:
             self.root.geometry("480x420")
 
     def on_reconcile(self):
-        """Sends reconcile or start command to safely restore/restart bridge paths."""
+        """Sends reconcile or recovers dead controller via existing lifecycle seam."""
         if self._last_raw_status is not None:
             self.client.reconcile()
         else:
-            self.client.start()
+            # Controller is absent: use existing Windows Scheduled Task lifecycle authority seam
+            self.reconcile_btn.config(text="Starting...")
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            start_controller_via_lifecycle(timeout_sec=5.0)
+            self.reconcile_btn.config(text="Restart / Reconcile")
         self.refresh()
 
     def on_open_logs(self):
-        """Opens log directory in Windows File Explorer."""
-        open_log_directory()
+        """Opens data or logs directory in Windows File Explorer."""
+        open_data_directory()
 
     def on_copy_report(self):
         """Generates sanitized diagnostic report and copies to system clipboard."""
