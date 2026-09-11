@@ -186,3 +186,219 @@ class TestProductShellAppIPC(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMacOSDiagnosticsAndRecovery(unittest.TestCase):
+    """Verifies macOS Diagnostics & Recovery helper functions and UI controls."""
+
+    def test_sanitize_diagnostic_text(self):
+        """Sanitizer redacts paths, GUIDs, and credentials."""
+        from macos.diagnostics import sanitize_diagnostic_text
+
+        raw = "User path: /Users/johndoe/Library/Logs/err.log with GUID {12345678-ABCD-EF01-2345-6789ABCDEF01} and token: secret123"
+        sanitized = sanitize_diagnostic_text(raw)
+        self.assertNotIn("/Users/johndoe", sanitized)
+        self.assertIn("<path redacted>", sanitized)
+        self.assertNotIn("12345678-ABCD", sanitized)
+        self.assertIn("<guid redacted>", sanitized)
+        self.assertNotIn("secret123", sanitized)
+        self.assertIn("token=<redacted>", sanitized)
+
+    def test_build_diagnostic_report_host_absent(self):
+        """Report for absent host truthfully reflects NOT RUNNING and safe defaults."""
+        from macos.diagnostics import build_diagnostic_report
+
+        report = build_diagnostic_report(None)
+        self.assertIn("Controller: NOT RUNNING", report)
+        self.assertIn("Peer State: NONE", report)
+        self.assertIn("Background service is not running", report)
+        self.assertIn("Deployed SHA:", report)
+
+    def test_build_diagnostic_report_running(self):
+        """Report for running controller reflects paths, mode, and sanitized errors."""
+        from macos.diagnostics import build_diagnostic_report
+
+        status = {
+            "controller_state": "ACTIVE",
+            "desired_state": "ENABLED",
+            "owner_pid": 4321,
+            "peer_available": True,
+            "peer_address": "198.168.10.5",
+            "local_bind_address": "198.168.10.4",
+            "speaker_path_state": "RUNNING",
+            "microphone_path_state": "IDLE",
+            "last_actionable_error": None,
+        }
+        report = build_diagnostic_report(status)
+        self.assertIn("RUNNING (PID 4321)", report)
+        self.assertIn("Connected (198.168.10.5)", report)
+        self.assertIn("Network Path: Ethernet", report)
+        self.assertIn("Speaker Path: RUNNING", report)
+        self.assertIn("Voice Input / Dictation: Automatic / Standby", report)
+
+    def test_get_diagnostics_view_data_clean_ui(self):
+        """View data does not expose raw PID or IP in UI text."""
+        from macos.diagnostics import get_diagnostics_view_data
+
+        status = {
+            "controller_state": "ACTIVE",
+            "desired_state": "ENABLED",
+            "owner_pid": 4321,
+            "peer_available": True,
+            "peer_address": "198.168.10.5",
+            "local_bind_address": "198.168.10.4",
+            "speaker_path_state": "RUNNING",
+            "microphone_path_state": "RUNNING",
+            "last_actionable_error": None,
+        }
+        data = get_diagnostics_view_data(status)
+        self.assertEqual(data["service"][0], "Running")
+        self.assertNotIn("4321", data["service"][0])
+        self.assertEqual(data["peer"][0], "Connected")
+        self.assertNotIn("198.168.10.5", data["peer"][0])
+        self.assertEqual(data["spk"][0], "RUNNING")
+        self.assertEqual(data["mic"][0], "RUNNING")
+
+    def test_start_controller_via_lifecycle_absent_task_fails_closed(self):
+        """When LaunchAgent is not installed/disabled, recovery fails closed and never installs."""
+        from unittest.mock import MagicMock, patch
+        from macos.diagnostics import start_controller_via_lifecycle
+
+        with patch("macos.diagnostics._query_launchagent_status", return_value="Not installed"), \
+             patch("macos.lifecycle.install_launch_agent") as mock_install, \
+             patch("macos.lifecycle.run_launchctl") as mock_launchctl:
+
+            recovered = start_controller_via_lifecycle(timeout_sec=0.2)
+            self.assertFalse(recovered)
+            mock_install.assert_not_called()
+            mock_launchctl.assert_not_called()
+
+    def test_start_controller_via_lifecycle_present_kickstarts(self):
+        """When LaunchAgent is installed and loaded, recovery kickstarts existing service."""
+        from unittest.mock import MagicMock, patch
+        from macos.diagnostics import start_controller_via_lifecycle
+
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+
+        with patch("macos.diagnostics._query_launchagent_status", return_value="Installed"), \
+             patch("macos.diagnostics.is_service_loaded", return_value=True), \
+             patch("macos.diagnostics.run_launchctl", return_value=mock_res) as mock_launchctl, \
+             patch("macos.lifecycle.install_launch_agent") as mock_install, \
+             patch("macos.cli.send_ipc_command", return_value={"owner_pid": 9999}):
+
+            recovered = start_controller_via_lifecycle(timeout_sec=1.0)
+            self.assertTrue(recovered)
+            mock_install.assert_not_called()
+            mock_launchctl.assert_called()
+            args = mock_launchctl.call_args[0][0]
+            self.assertIn("kickstart", args)
+
+    def test_reconcile_button_alive_controller(self):
+        """When controller is alive, Reconcile sends reconcile command via IPC."""
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:
+            self.skipTest(f"Tkinter display not available: {e}")
+
+        commands = []
+        def mock_ipc(cmd):
+            commands.append(cmd)
+            return {
+                "controller_state": "ACTIVE",
+                "desired_state": "ENABLED",
+                "peer_available": True,
+                "speaker_path_state": "RUNNING",
+                "microphone_path_state": "IDLE",
+            }
+
+        try:
+            app = ProductShellApp(root, ipc_client=mock_ipc, auto_refresh_ms=0)
+            commands.clear()
+            app.on_reconcile()
+            self.assertIn("reconcile", commands)
+        finally:
+            root.destroy()
+
+    def test_reconcile_button_dead_controller_recovers_via_lifecycle(self):
+        """When controller is absent, Reconcile delegates to start_controller_via_lifecycle."""
+        import tkinter as tk
+        from unittest.mock import patch
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as e:
+            self.skipTest(f"Tkinter display not available: {e}")
+
+        def mock_ipc(cmd):
+            return None
+
+        try:
+            app = ProductShellApp(root, ipc_client=mock_ipc, auto_refresh_ms=0)
+            with patch("macos.product_shell.start_controller_via_lifecycle", return_value=True) as mock_recover:
+                app.on_reconcile()
+                mock_recover.assert_called_once()
+        finally:
+            root.destroy()
+
+
+def test_get_deployed_sha_without_git_cli(tmp_path):
+    """When git CLI fails or is not in PATH, get_deployed_sha resolves SHA from repo metadata."""
+    from unittest.mock import patch
+    from macos.diagnostics import get_deployed_sha
+
+    test_sha = "aabbccddeeff00112233445566778899aabbccdd"
+
+    # Create dummy detached repo directory
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    head_file = git_dir / "HEAD"
+    head_file.write_text(test_sha + "\n", encoding="utf-8")
+
+    with patch("subprocess.run", side_effect=FileNotFoundError("git not found")):
+        resolved = get_deployed_sha(str(tmp_path))
+        assert resolved == test_sha
+
+
+def test_get_deployed_sha_worktree_indirection(tmp_path):
+    """When target directory is a worktree with a .git file, get_deployed_sha follows indirection."""
+    from unittest.mock import patch
+    import subprocess
+    from macos.diagnostics import get_deployed_sha
+
+    test_sha = "11223344556677889900aabbccddeeff11223344"
+
+    # Create main repo git dir
+    main_git = tmp_path / "main_repo" / ".git"
+    main_git.mkdir(parents=True)
+    (main_git / "refs" / "heads").mkdir(parents=True)
+    (main_git / "refs" / "heads" / "feature-x").write_text(test_sha + "\n", encoding="utf-8")
+
+    # Create worktree gitdir
+    wt_gitdir = main_git / "worktrees" / "wt1"
+    wt_gitdir.mkdir(parents=True)
+    (wt_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    (wt_gitdir / "HEAD").write_text("ref: refs/heads/feature-x\n", encoding="utf-8")
+
+    # Create worktree directory with .git file
+    wt_dir = tmp_path / "wt1"
+    wt_dir.mkdir()
+    (wt_dir / ".git").write_text(f"gitdir: {wt_gitdir}\n", encoding="utf-8")
+
+    with patch("subprocess.run", side_effect=subprocess.SubprocessError("git error")):
+        resolved = get_deployed_sha(str(wt_dir))
+        assert resolved == test_sha
+
+
+def test_open_data_directory(tmp_path):
+    """open_data_directory calls open with existing log or data directory."""
+    from unittest.mock import patch
+    from macos.diagnostics import open_data_directory
+
+    with patch("subprocess.Popen") as mock_popen:
+        assert open_data_directory() is True
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args[0] == "open"
