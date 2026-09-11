@@ -29,7 +29,7 @@ class OwnershipJournalManager:
     def journal_file(self) -> str:
         return self.controller.journal_file
 
-    def load_journal(self) -> Tuple[Optional[dict], Optional[str]]:
+    def load_ownership_journal(self) -> Tuple[Optional[dict], Optional[str]]:
         """Loads ownership journal."""
         if not os.path.exists(self.journal_file):
             return None, None
@@ -44,7 +44,7 @@ class OwnershipJournalManager:
             logger.error(err_msg)
             return None, err_msg
 
-    def write_journal(self, data: dict) -> bool:
+    def write_ownership_journal(self, data: dict) -> bool:
         """Atomically writes ownership journal. Raises or returns False on failure."""
         try:
             os.makedirs(os.path.dirname(self.journal_file), exist_ok=True)
@@ -57,7 +57,7 @@ class OwnershipJournalManager:
             logger.error("Failed to write ownership journal %s: %s", self.journal_file, exc)
             return False
 
-    def clear_journal(self) -> bool:
+    def clear_ownership_journal(self) -> bool:
         """Removes the ownership journal file cleanly."""
         try:
             if os.path.exists(self.journal_file):
@@ -66,6 +66,11 @@ class OwnershipJournalManager:
         except Exception as exc:
             logger.warning("Failed to remove ownership journal %s: %s", self.journal_file, exc)
             return False
+
+    # Aliases for backwards compatibility if needed
+    load_journal = load_ownership_journal
+    write_journal = write_ownership_journal
+    clear_journal = clear_ownership_journal
 
     def record_child_started(self, role: str, pid: int, cmd: List[str], port: int) -> bool:
         """Records child startup in journal with strict create_time verification."""

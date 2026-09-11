@@ -241,9 +241,9 @@ class MacMicrophoneActivityMonitor:
 class VoiceDuckingController:
     """Manages voice ducking settings, microphone activity monitoring, and volume relay integration."""
 
-    def __init__(self, controller: Any):
+    def __init__(self, controller: Any, settings_path: Optional[str] = None):
         self.controller = controller
-        self.settings = VoiceDuckingSettings()
+        self.settings = VoiceDuckingSettings(path=settings_path) if settings_path else VoiceDuckingSettings()
         self.duck_level = self.settings.load_duck_level()
         self.monitor = MacMicrophoneActivityMonitor(
             on_activity_change=self._on_activity_changed,

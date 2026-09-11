@@ -47,6 +47,8 @@ class UIState:
     microphone_status: str
     action_required_message: Optional[str] = None
     raw_status: Optional[Dict[str, Any]] = None
+    duck_level: int = 20
+    local_voice_active: bool = False
 
 
 def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIState:
@@ -78,6 +80,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
     mic_path = status_payload.get("microphone_path_state", "IDLE")
     last_error = status_payload.get("last_actionable_error")
     last_mic_error = status_payload.get("last_actionable_microphone_error")
+    duck_level = int(status_payload.get("duck_level", 20)) if status_payload.get("duck_level") is not None else 20
+    local_voice_active = bool(status_payload.get("local_voice_active", False))
 
     def map_path(path_state: str, is_mic: bool = False) -> str:
         if path_state == "RUNNING":
@@ -104,6 +108,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=DIR_STOPPED,
             action_required_message=None,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 2. Host error / Action required
@@ -116,6 +122,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=mic_ui,
             action_required_message=err_detail,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 3. Peer unavailable
@@ -127,6 +135,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=mic_ui,
             action_required_message=None,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 4. Both speaker + mic active -> Connected
@@ -138,6 +148,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=DIR_ACTIVE,
             action_required_message=None,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 4b. Playback mode: speaker RUNNING and mic IDLE / STOPPED -> Connected
@@ -149,6 +161,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=DIR_OFF,
             action_required_message=None,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 4c. Dictation mode: mic RUNNING and speaker STOPPED / IDLE -> Connected
@@ -160,6 +174,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=DIR_ACTIVE,
             action_required_message=None,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 5. One direction failed / unavailable -> Degraded
@@ -179,6 +195,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
             microphone_status=mic_ui,
             action_required_message=None,
             raw_status=status_payload,
+            duck_level=duck_level,
+            local_voice_active=local_voice_active,
         )
 
     # 6. Default waiting state
@@ -189,6 +207,8 @@ def map_controller_status_to_ui(status_payload: Optional[Dict[str, Any]]) -> UIS
         microphone_status=mic_ui,
         action_required_message=None,
         raw_status=status_payload,
+        duck_level=duck_level,
+        local_voice_active=local_voice_active,
     )
 
 
@@ -207,10 +227,11 @@ class ProductShellApp:
         self._refresh_timer_id: Optional[str] = None
         self._diagnostics_expanded: bool = False
         self._last_raw_status: Optional[Dict[str, Any]] = None
+        self._user_adjusting_duck: bool = False
 
         self.root.title("Cross-Desk Flow")
-        self.root.geometry("460x360")
-        self.root.minsize(420, 320)
+        self.root.geometry("460x390")
+        self.root.minsize(420, 350)
 
         # Style configuration
         self._setup_style()
@@ -272,6 +293,34 @@ class ProductShellApp:
         lbl_mic_title.pack(side=tk.LEFT)
         self.lbl_mic_status = ttk.Label(row2, text="", font=("System", 12, "bold"))
         self.lbl_mic_status.pack(side=tk.RIGHT)
+
+        # Row 3: Local Voice status
+        row3 = ttk.Frame(dir_frame)
+        row3.pack(fill=tk.X, pady=3)
+        lbl_voice_title = ttk.Label(row3, text="Local Voice", font=("System", 12))
+        lbl_voice_title.pack(side=tk.LEFT)
+        self.lbl_voice_status = ttk.Label(row3, text="Inactive", font=("System", 12, "bold"))
+        self.lbl_voice_status.pack(side=tk.RIGHT)
+
+        # Row 4: Ducking volume control (When Mac microphone is active: 0–100%)
+        row4 = ttk.Frame(dir_frame)
+        row4.pack(fill=tk.X, pady=(6, 2))
+        self.lbl_duck_title = ttk.Label(
+            row4,
+            text="When Mac microphone is active: 20%",
+            font=("System", 11),
+        )
+        self.lbl_duck_title.pack(side=tk.LEFT)
+
+        self.duck_scale = ttk.Scale(
+            row4,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            command=self.on_duck_slider_change,
+        )
+        self.duck_scale.set(20)
+        self.duck_scale.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(10, 0))
 
         # 3. Action / Error Banner
         self.lbl_action_banner = ttk.Label(
@@ -403,10 +452,42 @@ class ProductShellApp:
         self.lbl_spk_status.config(foreground=dir_color_map.get(state.speaker_status, "#000000"))
         self.lbl_mic_status.config(foreground=dir_color_map.get(state.microphone_status, "#000000"))
 
+        # Voice status
+        if state.local_voice_active:
+            self.lbl_voice_status.config(text="Active", foreground="#2E7D32")
+        else:
+            self.lbl_voice_status.config(text="Inactive", foreground="#757575")
+
+        # Duck level slider (sync from state if user is not currently sliding)
+        if not self._user_adjusting_duck:
+            self._user_adjusting_duck = True
+            try:
+                self.duck_scale.set(state.duck_level)
+                self.lbl_duck_title.config(text=f"When Mac microphone is active: {int(state.duck_level)}%")
+            finally:
+                self._user_adjusting_duck = False
+
         if state.action_required_message:
             self.lbl_action_banner.config(text=f"Action required — {state.action_required_message}")
         else:
             self.lbl_action_banner.config(text="")
+
+    def on_duck_slider_change(self, val: str):
+        """Dispatches 'set-duck-level' IPC command when slider moves."""
+        if self._user_adjusting_duck:
+            return
+        self._user_adjusting_duck = True
+        try:
+            level_int = int(round(float(val)))
+            self.lbl_duck_title.config(text=f"When Mac microphone is active: {level_int}%")
+            if callable(self.ipc_client):
+                try:
+                    self.ipc_client("set-duck-level", level=level_int)
+                except TypeError:
+                    # Fallback for mock clients that don't take keyword arguments
+                    self.ipc_client("set-duck-level")
+        finally:
+            self._user_adjusting_duck = False
 
     def _update_diagnostics_view(self, status_dict: Optional[Dict[str, Any]]):
         """Updates diagnostic key-value fields from raw controller status."""

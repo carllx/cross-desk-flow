@@ -18,13 +18,18 @@ from bridge_core.contract import (
 from .controller import MacBridgeController
 
 
-def send_ipc_command(command: str, port: int = DEFAULT_LOCAL_IPC_PORT) -> Optional[Dict[str, Any]]:
+def send_ipc_command(
+    command: str, port: int = DEFAULT_LOCAL_IPC_PORT, level: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
     """Sends command to running controller owner via local loopback TCP socket."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2.0)
         s.connect(("127.0.0.1", port))
-        req = json.dumps({"command": command})
+        req_payload: Dict[str, Any] = {"command": command}
+        if level is not None:
+            req_payload["level"] = level
+        req = json.dumps(req_payload)
         s.sendall(req.encode("utf-8"))
         data = s.recv(8192)
         s.close()

@@ -1,16 +1,5 @@
 """Comprehensive regression and external behavior automated tests for macOS controller.
-
-Covers:
-1. Controller external behavior (idempotent Start/Stop, Status read-only, owned-child-only cleanup).
-2. Process-level cross-command control over IPC (Start, repeated Start, Status, Stop).
-3. Process-level singleton test (second owner denied, repeated start does not drop lock).
-4. Deterministic multi-interface route resolution through handle_peer_message seam:
-   - Peer Windows packet -> Mac candidate local bind IP.
-   - End-to-end through controller reconcile: receiver builder receives correct Mac local bind IP and resolved device_id.
-5. Peer unavailable behavior (enters DISCOVERING, does not launch pipeline).
-6. Multiple-responder ambiguity (enters AMBIGUOUS_PEER, ambiguity externally visible, recovers when secondary expires).
-7. Device resolver behavior (built-in output resolved, failure reports error, refuses fallback).
-8. Cross-platform shared contract adherence (verifies common constants, ports, protocols).
+Covers: external behavior, IPC lifecycle, singleton lock, route resolution, peer availability, ambiguity, device resolution, and shared contracts.
 """
 
 import json
@@ -402,10 +391,16 @@ def test_end_to_end_mac_discovery_routing_and_receiver_bind(temp_state_file):
     assert status.local_bind_address == mac_direct_ip
     assert status.speaker_path_state == PathState.RUNNING.value
 
-    # 3. Assert receiver builder received dynamic Mac bind address and resolved device ID
+    # 3. Assert receiver builder received internal loopback bind and resolved device ID,
+    # while SpeakerVolumeRelay intercepts on the dynamic Mac bind address
     assert builder.last_built_cmd is not None
-    assert f"--bind={mac_direct_ip}" in builder.last_built_cmd
+    assert f"--bind=127.0.0.1" in builder.last_built_cmd
+    assert f"--port=5005" in builder.last_built_cmd
     assert f"--device=88" in builder.last_built_cmd
+    assert controller.voice_ducking.relay is not None
+    assert controller.voice_ducking.relay.bind_ip == mac_direct_ip
+    assert controller.voice_ducking.relay.listen_port == 5004
+    assert controller.voice_ducking.relay.target_port == 5005
 
     controller.shutdown()
 

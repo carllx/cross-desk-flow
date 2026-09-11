@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 CONTROL_PROTOCOL_VERSION = 1
 DEFAULT_CONTROL_PORT = 50100
 DEFAULT_SPEAKER_RTP_PORT = 5004
+DEFAULT_SPEAKER_INTERNAL_RTP_PORT = 5005
 DEFAULT_MIC_RTP_PORT = 5006
 
 # Local IPC control surface
@@ -104,6 +105,8 @@ class ControllerStatus:
     pack43_available: Optional[bool] = None
     last_actionable_microphone_error: Optional[str] = None
     mode: str = "PLAYBACK"
+    duck_level: Optional[int] = None
+    local_voice_active: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

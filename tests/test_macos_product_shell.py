@@ -183,6 +183,32 @@ class TestProductShellAppIPC(unittest.TestCase):
         self.assertEqual(app.lbl_overall.cget("text"), STATUS_ACTION_REQUIRED)
         self.assertIn("Background service is not running", app.lbl_action_banner.cget("text"))
 
+    def test_voice_ducking_ui_state_and_slider(self):
+        """Product shell reflects duck_level and local_voice_active, and slider emits set-duck-level IPC."""
+        ipc_calls = []
+        def mock_ipc(cmd, **kwargs):
+            ipc_calls.append((cmd, kwargs))
+            return {
+                "controller_state": "ACTIVE",
+                "desired_state": "ENABLED",
+                "peer_available": True,
+                "speaker_path_state": "RUNNING",
+                "microphone_path_state": "RUNNING",
+                "duck_level": 35,
+                "local_voice_active": True,
+            }
+
+        app = ProductShellApp(self.root, ipc_client=mock_ipc, auto_refresh_ms=0)
+        self.assertEqual(app.lbl_voice_status.cget("text"), "Active")
+        self.assertEqual(app.lbl_duck_title.cget("text"), "When Mac microphone is active: 35%")
+        self.assertEqual(int(round(app.duck_scale.get())), 35)
+
+        # Move slider
+        ipc_calls.clear()
+        app.on_duck_slider_change("50")
+        self.assertEqual(app.lbl_duck_title.cget("text"), "When Mac microphone is active: 50%")
+        self.assertEqual(ipc_calls, [("set-duck-level", {"level": 50})])
+
 
 if __name__ == "__main__":
     unittest.main()

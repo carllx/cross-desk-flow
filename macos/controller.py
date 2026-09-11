@@ -26,6 +26,7 @@ from bridge_core.contract import (
     DEFAULT_MIC_RTP_PORT,
     DEFAULT_SINGLETON_PORT,
     DEFAULT_SPEAKER_RTP_PORT,
+    DEFAULT_SPEAKER_INTERNAL_RTP_PORT,
     ControllerStatus,
     DesiredState,
     HostRole,
@@ -91,7 +92,7 @@ class MacBridgeController:
         self._ipc_server = LocalControlServer(self, port=ipc_port)
 
         self._state_store = ControllerStateStore(state_file=state_file)
-        self._desired_state = self._load_persisted_desired_state()
+        self._desired_state = self._state_store.load_desired_state()
         self._controller_state = LifecycleState.STOPPED
         self._speaker_path_state = PathState.IDLE
         self._last_actionable_error: Optional[str] = None
@@ -107,7 +108,8 @@ class MacBridgeController:
         self._last_actionable_microphone_error: Optional[str] = None
         self.dictation_responder = MacDictationResponder(self)
         self.ownership_manager = OwnershipJournalManager(self)
-        self.voice_ducking = VoiceDuckingController(self)
+        settings_path = f"{state_file}.settings.json" if state_file != DEFAULT_STATE_FILE else None
+        self.voice_ducking = VoiceDuckingController(self, settings_path=settings_path)
         self._lock = threading.RLock()
 
         # Wire discovery service for HostRole.MACOS
@@ -144,14 +146,8 @@ class MacBridgeController:
     def _record_child_stopped(self, role: str) -> None:
         return self.ownership_manager.record_child_stopped(role)
 
-    def _verify_child_identity(self, expected_role: str, pid: int, port: int, peer: Optional[str] = None) -> Tuple[bool, str]:
-        return self.ownership_manager.verify_child_identity(expected_role, pid, port, peer)
-
     def _terminate_stale_child(self, pid: int, role: str, timeout_sec: float = 3.0) -> bool:
         return self.ownership_manager.terminate_stale_child(pid, role, timeout_sec)
-
-    def _recover_stale_owned_children(self) -> Tuple[bool, Optional[str]]:
-        return self.ownership_manager.recover_stale_owned_children()
 
     def set_duck_level(self, level: int) -> int:
         """Sets the ducking level (0-100) via VoiceDuckingController."""
@@ -190,15 +186,10 @@ class MacBridgeController:
 
         if role == "speaker":
             self._speaker_child_pid = None
+            self.voice_ducking.stop_relay()
         else:
             self._microphone_child_pid = None
         return True
-
-    def _load_persisted_desired_state(self) -> DesiredState:
-        return self._state_store.load_desired_state()
-
-    def _persist_desired_state(self, state: DesiredState) -> None:
-        self._state_store.persist_desired_state(state)
 
 
     def start_host(self) -> bool:
@@ -223,7 +214,7 @@ class MacBridgeController:
                     return False
 
             # Recover any stale orphaned children left by previous crashed owner
-            rec_ok, rec_err = self._recover_stale_owned_children()
+            rec_ok, rec_err = self.ownership_manager.recover_stale_owned_children()
             if not rec_ok:
                 self._last_actionable_error = rec_err or "Stale child recovery failed-closed"
                 self._controller_state = LifecycleState.ERROR
@@ -231,7 +222,7 @@ class MacBridgeController:
                 return False
 
             # Reload persisted desired state to ensure consistency
-            self._desired_state = self._load_persisted_desired_state()
+            self._desired_state = self._state_store.load_desired_state()
             if self._desired_state == DesiredState.STOPPED_BY_USER:
                 self._controller_state = LifecycleState.STOPPED
                 self._microphone_desired = False
@@ -277,21 +268,19 @@ class MacBridgeController:
                     return False
 
             # Recover any stale orphaned children left by previous crashed owner
-            rec_ok, rec_err = self._recover_stale_owned_children()
+            rec_ok, rec_err = self.ownership_manager.recover_stale_owned_children()
             if not rec_ok:
                 self._last_actionable_error = rec_err or "Stale child recovery failed-closed"
                 self._controller_state = LifecycleState.ERROR
                 logger.error("Controller start rejected: %s", self._last_actionable_error)
                 return False
 
-
             self._desired_state = DesiredState.ENABLED
-            self._persist_desired_state(DesiredState.ENABLED)
+            self._state_store.persist_desired_state(DesiredState.ENABLED)
             self._microphone_desired = False
             self._controller_state = LifecycleState.STARTING
             self._speaker_path_state = PathState.IDLE
             self._last_actionable_error = None
-
 
             # Start IPC server
             self._ipc_server.start()
@@ -331,7 +320,7 @@ class MacBridgeController:
         """Idempotently stops speaker and microphone pipelines and persists STOPPED_BY_USER."""
         with self._lock:
             self._desired_state = DesiredState.STOPPED_BY_USER
-            self._persist_desired_state(DesiredState.STOPPED_BY_USER)
+            self._state_store.persist_desired_state(DesiredState.STOPPED_BY_USER)
             self._microphone_desired = False
 
             # Stop owned speaker pipeline child
@@ -459,6 +448,8 @@ class MacBridgeController:
                 microphone_port=DEFAULT_MIC_RTP_PORT,
                 pack43_available=None,
                 last_actionable_microphone_error=self._last_actionable_microphone_error,
+                duck_level=self.voice_ducking.get_duck_level(),
+                local_voice_active=self.voice_ducking.is_external_mic_active,
             )
 
     def reconcile(self) -> None:
@@ -556,19 +547,31 @@ class MacBridgeController:
             self._speaker_path_state = PathState.FAILED
             return
 
-        # Build GStreamer receiver command
+        # Start SpeakerVolumeRelay to intercept external RTP (5004) and forward to internal receiver (5005)
+        if not self.voice_ducking.start_relay(
+            bind_ip=local_bind,
+            listen_port=DEFAULT_SPEAKER_RTP_PORT,
+            target_port=DEFAULT_SPEAKER_INTERNAL_RTP_PORT,
+        ):
+            self._last_actionable_error = "Failed to start speaker volume relay proxy"
+            self._controller_state = LifecycleState.ERROR
+            self._speaker_path_state = PathState.FAILED
+            return
+
+        # Build GStreamer receiver command listening on internal loopback port
         cmd = self.pipeline_builder.build_receiver_command(
-            local_bind_ip=local_bind,
-            local_port=DEFAULT_SPEAKER_RTP_PORT,
+            local_bind_ip="127.0.0.1",
+            local_port=DEFAULT_SPEAKER_INTERNAL_RTP_PORT,
             device_id=dev.device_id,
         )
 
         try:
             pid = self.process_runner.start_process(cmd)
             self._speaker_child_pid = pid
-            journal_ok = self._record_child_started("speaker", pid, cmd, DEFAULT_SPEAKER_RTP_PORT)
+            journal_ok = self._record_child_started("speaker", pid, cmd, DEFAULT_SPEAKER_INTERNAL_RTP_PORT)
             if not journal_ok:
                 cleanup_ok = self.process_runner.stop_process(pid)
+                self.voice_ducking.stop_relay()
                 if cleanup_ok:
                     self._speaker_child_pid = None
                     self._speaker_path_state = PathState.FAILED
@@ -591,6 +594,7 @@ class MacBridgeController:
             self._controller_state = LifecycleState.ACTIVE
             self._last_actionable_error = None
         except Exception as exc:
+            self.voice_ducking.stop_relay()
             self._last_actionable_error = f"Failed to start speaker receiver: {exc}"
             self._active_peer_address = None
             self._active_local_bind = None
@@ -688,8 +692,6 @@ class MacBridgeController:
                 f"Failed to start microphone sender: {exc}"
             )
             self._microphone_path_state = PathState.FAILED
-
-
 
     def _on_peer_discovered(self, peer_ip: str, local_ip: str, peer_port: int, peer_inst: str) -> None:
         with self._lock:

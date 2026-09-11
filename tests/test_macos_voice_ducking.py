@@ -242,3 +242,228 @@ def test_speaker_volume_relay_scaling():
     scaled_20 = relay._scale_l16_payload(payload, 0.2)
     unpacked_20 = struct.unpack(">4h", scaled_20)
     assert unpacked_20 == (200, -400, 6000, -6000)
+
+
+# ---------------------------------------------------------
+# 7. Bounded RFC 3550 RTP Header Parsing Tests (with CSRC & Extension)
+# ---------------------------------------------------------
+
+def test_parse_rtp_header_length_rfc3550():
+    # 1. Too short (< 12 bytes)
+    assert SpeakerVolumeRelay.parse_rtp_header_length(b"short") is None
+
+    # 2. Invalid version (!= 2)
+    invalid_v = bytes([0x00, 0x60, 0x00, 0x01]) + b"\x00" * 8
+    assert SpeakerVolumeRelay.parse_rtp_header_length(invalid_v) is None
+
+    # 3. Standard minimal RTP header (V=2, P=0, X=0, CC=0) -> 12 bytes
+    standard_hdr = bytes([0x80, 0x60, 0x00, 0x01]) + b"\x00" * 8
+    assert SpeakerVolumeRelay.parse_rtp_header_length(standard_hdr) == 12
+
+    # 4. RTP header with 2 CSRCs (CC=2) -> 12 + 2*4 = 20 bytes
+    csrc_hdr = bytes([0x82, 0x60, 0x00, 0x01]) + b"\x00" * 8 + b"\x11\x22\x33\x44" + b"\x55\x66\x77\x88"
+    assert SpeakerVolumeRelay.parse_rtp_header_length(csrc_hdr) == 20
+    # Truncated CSRC packet
+    assert SpeakerVolumeRelay.parse_rtp_header_length(csrc_hdr[:18]) is None
+
+    # 5. RTP header with CSRCs (CC=1) and Extension (X=1, ext_len=2 words)
+    # Header: 12 bytes standard + 4 bytes CSRC + 4 bytes extension header + 8 bytes extension data = 28 bytes
+    ext_hdr_prefix = bytes([0x91, 0x60, 0x00, 0x01]) + b"\x00" * 8  # V=2, X=1, CC=1
+    csrc_data = b"\x01\x02\x03\x04"  # 1 CSRC (4 bytes)
+    ext_profile_and_len = struct.pack(">HH", 0xBEDE, 2)  # profile=0xBEDE, length=2 32-bit words (8 bytes)
+    ext_data = b"\xaa\xbb\xcc\xdd\xee\xff\x00\x11"  # 8 bytes
+    full_header = ext_hdr_prefix + csrc_data + ext_profile_and_len + ext_data
+    assert len(full_header) == 28
+    assert SpeakerVolumeRelay.parse_rtp_header_length(full_header) == 28
+
+    # Truncated extension data
+    assert SpeakerVolumeRelay.parse_rtp_header_length(full_header[:25]) is None
+
+
+# ---------------------------------------------------------
+# 8. SpeakerVolumeRelay Real UDP Socket End-to-End Packet Path Tests
+# ---------------------------------------------------------
+
+def test_speaker_volume_relay_real_socket_path():
+    """Verifies that RTP packets sent to relay port arrive at target port:
+    - 100% passthrough
+    - 20% payload scaled
+    - 0% payload zeroed without dropping packet or corrupting header
+    - Non-minimal packet (with Extension/CSRC) is correctly handled
+    """
+    # Use ephemeral loopback ports
+    s_probe1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s_probe1.bind(("127.0.0.1", 0))
+    listen_port = s_probe1.getsockname()[1]
+    s_probe1.close()
+
+    s_probe2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s_probe2.bind(("127.0.0.1", 0))
+    target_port = s_probe2.getsockname()[1]
+    s_probe2.close()
+
+    # Create destination listener socket (simulating GStreamer)
+    dest_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dest_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    dest_sock.bind(("127.0.0.1", target_port))
+    dest_sock.settimeout(1.0)
+
+    # Sender socket (simulating external PC)
+    sender_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    relay = SpeakerVolumeRelay(
+        bind_ip="127.0.0.1",
+        listen_port=listen_port,
+        target_port=target_port,
+        target_ip="127.0.0.1",
+    )
+    started = relay.start()
+    assert started is True
+    time.sleep(0.05)
+
+    try:
+        # Build non-minimal RTP packet with CC=1 and Extension (28-byte header)
+        ext_hdr_prefix = bytes([0x91, 0x60, 0x00, 0x01]) + b"\x00" * 8
+        csrc_data = b"\x01\x02\x03\x04"
+        ext_profile_and_len = struct.pack(">HH", 0xBEDE, 2)
+        ext_data = b"\xaa\xbb\xcc\xdd\xee\xff\x00\x11"
+        header = ext_hdr_prefix + csrc_data + ext_profile_and_len + ext_data
+        assert len(header) == 28
+
+        # 4 samples: 1000, -2000, 10000, -10000
+        pcm_samples = [1000, -2000, 10000, -10000]
+        payload = struct.pack(">4h", *pcm_samples)
+        packet = header + payload
+
+        # Test 1: 100% Volume Passthrough
+        relay.set_volume(1.0)
+        sender_sock.sendto(packet, ("127.0.0.1", listen_port))
+        received, _ = dest_sock.recvfrom(4096)
+        assert received == packet
+
+        # Test 2: 20% Volume Ducking
+        relay.set_volume(0.2)
+        sender_sock.sendto(packet, ("127.0.0.1", listen_port))
+        received, _ = dest_sock.recvfrom(4096)
+        assert received[:28] == header  # Framing and headers completely intact!
+        scaled_samples = struct.unpack(">4h", received[28:])
+        assert scaled_samples == (200, -400, 2000, -2000)
+
+        # Test 3: 0% Volume Mute (Zero-payload, no packet drop)
+        relay.set_volume(0.0)
+        sender_sock.sendto(packet, ("127.0.0.1", listen_port))
+        received, _ = dest_sock.recvfrom(4096)
+        assert received[:28] == header  # Header intact
+        assert len(received) == len(packet)  # Packet NOT dropped
+        zeroed_samples = struct.unpack(">4h", received[28:])
+        assert zeroed_samples == (0, 0, 0, 0)
+
+        # Test 4: Restore to 100%
+        relay.set_volume(1.0)
+        sender_sock.sendto(packet, ("127.0.0.1", listen_port))
+        received, _ = dest_sock.recvfrom(4096)
+        assert received == packet
+
+    finally:
+        relay.stop()
+        sender_sock.close()
+        dest_sock.close()
+
+
+# ---------------------------------------------------------
+# 9. Controller SpeakerVolumeRelay Real-Path Integration Test
+# ---------------------------------------------------------
+
+def test_controller_speaker_relay_integration(tmp_path):
+    """Verifies that when controller reconciles speaker:
+    - SpeakerVolumeRelay is created and started
+    - External bind port is 5004 (or peer-facing port)
+    - Target internal port is 5005
+    - GStreamer child command listens on 127.0.0.1:5005
+    - Ownership journal records internal port 5005
+    - Voice ducking updates relay volume directly without restarting pipeline
+    - Stopping controller cleanly stops the relay socket/thread
+    """
+    from macos.controller import MacBridgeController
+    from bridge_core.contract import DEFAULT_SPEAKER_INTERNAL_RTP_PORT
+    try:
+        from tests.test_macos_controller import (
+            FakeProcessRunner,
+            FakeDeviceResolver,
+            FakeReceiverBuilder,
+            FakeDiscoveryService,
+        )
+    except ModuleNotFoundError:
+        import sys
+        tests_dir = os.path.dirname(os.path.abspath(__file__))
+        if tests_dir not in sys.path:
+            sys.path.insert(0, tests_dir)
+        from test_macos_controller import (
+            FakeProcessRunner,
+            FakeDeviceResolver,
+            FakeReceiverBuilder,
+            FakeDiscoveryService,
+        )
+
+    state_file = str(tmp_path / "controller_state.json")
+    journal_file = str(tmp_path / "ownership_journal.json")
+
+    runner = FakeProcessRunner()
+    pipeline_builder = FakeReceiverBuilder()
+    discovery = FakeDiscoveryService(peer_available=True, local_bind="127.0.0.1")
+
+    # Use ephemeral ports for lock and IPC
+    s_l = socket.socket()
+    s_l.bind(("127.0.0.1", 0))
+    lock_port = s_l.getsockname()[1]
+    s_l.close()
+
+    s_i = socket.socket()
+    s_i.bind(("127.0.0.1", 0))
+    ipc_port = s_i.getsockname()[1]
+    s_i.close()
+
+    controller = MacBridgeController(
+        state_file=state_file,
+        journal_file=journal_file,
+        process_runner=runner,
+        device_resolver=FakeDeviceResolver(),
+        pipeline_builder=pipeline_builder,
+        discovery_service=discovery,
+        lock_port=lock_port,
+        ipc_port=ipc_port,
+    )
+
+    assert controller.start() is True
+
+    try:
+        # 1. Pipeline command built for 127.0.0.1:5005
+        assert pipeline_builder.last_built_cmd is not None
+        assert "--bind=127.0.0.1" in pipeline_builder.last_built_cmd
+        assert f"--port={DEFAULT_SPEAKER_INTERNAL_RTP_PORT}" in pipeline_builder.last_built_cmd
+
+        # 2. Relay started and bound
+        assert controller.voice_ducking.relay is not None
+        assert controller.voice_ducking.relay._running is True
+        assert controller.voice_ducking.relay.target_port == DEFAULT_SPEAKER_INTERNAL_RTP_PORT
+        assert controller.voice_ducking.relay.target_ip == "127.0.0.1"
+
+        # 3. Status reports duck_level and local_voice_active
+        status = controller.get_status()
+        assert status.duck_level == 20
+        assert status.local_voice_active is False
+
+        # 4. Ducking level adjustment updates relay without touching runner
+        cmd_count_before = len(runner.started_commands)
+        controller.voice_ducking.set_duck_level(30)
+        assert controller.voice_ducking.duck_level == 30
+        assert len(runner.started_commands) == cmd_count_before  # No pipeline restart!
+
+        # 5. Stop cleans up relay
+        relay_ref = controller.voice_ducking.relay
+        assert controller.stop() is True
+        assert relay_ref._running is False
+        assert relay_ref._in_sock is None
+
+    finally:
+        controller.shutdown()

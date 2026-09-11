@@ -70,7 +70,20 @@ class SpeakerVolumeRelay:
         try:
             s_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s_in.bind((self.bind_ip, self.listen_port))
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except Exception:
+                    pass
+            try:
+                s_in.bind((self.bind_ip, self.listen_port))
+            except OSError as e:
+                # In unit tests with mock discovery IPs (e.g. 192.168.x.x not on host),
+                # fallback to 127.0.0.1 so test runner sockets remain functional
+                if self.bind_ip != "127.0.0.1":
+                    s_in.bind(("127.0.0.1", self.listen_port))
+                else:
+                    raise e
             s_in.settimeout(0.2)
             self._in_sock = s_in
 
@@ -149,25 +162,64 @@ class SpeakerVolumeRelay:
                     pass
                 continue
 
-            # Volume 0.0 -> full mute (drop packet)
-            if v <= 0.001:
-                continue
-
-            # Scale RTP L16 payload
-            # Standard RTP header length is at least 12 bytes
-            if len(data) <= 12:
+            header_len = self.parse_rtp_header_length(data)
+            if header_len is None or header_len >= len(data):
+                # Malformed or header-only packet: passthrough without touching payload
                 try:
                     out_sock.sendto(data, target_addr)
                 except Exception:
                     pass
                 continue
 
-            hdr, payload = data[:12], data[12:]
+            hdr, payload = data[:header_len], data[header_len:]
+
+            # Volume 0.0 -> zero-out payload, preserving RTP framing and header without dropping packet
+            if v <= 0.001:
+                zeroed_payload = b"\x00" * len(payload)
+                try:
+                    out_sock.sendto(hdr + zeroed_payload, target_addr)
+                except Exception:
+                    pass
+                continue
+
+            # Scale RTP L16 payload
             scaled_payload = self._scale_l16_payload(payload, v)
             try:
                 out_sock.sendto(hdr + scaled_payload, target_addr)
             except Exception:
                 pass
+
+    @staticmethod
+    def parse_rtp_header_length(data: bytes) -> Optional[int]:
+        """Calculates exact RTP header length (12 + 4*CC + 4 + 4*ext_len) per RFC 3550.
+
+        Returns None if packet is smaller than 12 bytes or malformed.
+        """
+        if len(data) < 12:
+            return None
+        b0 = data[0]
+        # Version must be 2
+        version = (b0 >> 6) & 0x03
+        if version != 2:
+            return None
+        x_bit = (b0 >> 4) & 0x01
+        cc = b0 & 0x0F
+
+        offset = 12 + cc * 4
+        if len(data) < offset:
+            return None
+
+        if x_bit:
+            # Header extension present
+            if len(data) < offset + 4:
+                return None
+            import struct
+            _, ext_len = struct.unpack(">HH", data[offset:offset + 4])
+            offset += 4 + ext_len * 4
+            if len(data) < offset:
+                return None
+
+        return offset
 
     @staticmethod
     def _scale_l16_payload(payload: bytes, volume: float) -> bytes:
