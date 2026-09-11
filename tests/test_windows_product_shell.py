@@ -371,9 +371,10 @@ def test_dead_controller_recovery_task_absent_preserves_autostart():
     """When controller is dead and Scheduled Task is absent, recovery fails safely and NEVER installs task."""
     from windows.diagnostics import start_controller_via_lifecycle
 
-    with patch("windows.task_scheduler.is_scheduled_task_installed", return_value=False), \
+    with patch("windows.diagnostics._query_task_via_schtasks", return_value="Not installed"), \
          patch("windows.task_scheduler.install_scheduled_task") as mock_install, \
-         patch("windows.task_scheduler.register_scheduled_task") as mock_register:
+         patch("windows.task_scheduler.register_scheduled_task") as mock_register, \
+         patch("subprocess.run") as mock_run:
 
         recovered = start_controller_via_lifecycle(timeout_sec=0.5)
 
@@ -383,18 +384,19 @@ def test_dead_controller_recovery_task_absent_preserves_autostart():
         # Must NEVER install or register Scheduled Task
         mock_install.assert_not_called()
         mock_register.assert_not_called()
+        # Must not run any task
+        mock_run.assert_not_called()
 
 
-def test_dead_controller_recovery_task_present_triggers_task():
-    """When controller is dead and Scheduled Task is present, recovery runs task and waits for IPC."""
+def test_dead_controller_recovery_task_present_triggers_schtasks():
+    """When controller is dead and Scheduled Task is present, recovery runs task via schtasks and waits for IPC."""
     from windows.diagnostics import start_controller_via_lifecycle
 
-    mock_task = MagicMock()
-    mock_folder = MagicMock()
-    mock_folder.GetTask.return_value = mock_task
+    mock_res = MagicMock()
+    mock_res.returncode = 0
 
-    with patch("windows.task_scheduler.is_scheduled_task_installed", return_value=True), \
-         patch("windows.task_scheduler._get_scheduler_folder", return_value=mock_folder), \
+    with patch("windows.diagnostics._query_task_via_schtasks", return_value="Installed"), \
+         patch("subprocess.run", return_value=mock_res) as mock_run, \
          patch("windows.task_scheduler.install_scheduled_task") as mock_install, \
          patch("windows.task_scheduler.register_scheduled_task") as mock_register, \
          patch("windows.cli.send_ipc_command", return_value={"owner_pid": 1234}):
@@ -402,9 +404,90 @@ def test_dead_controller_recovery_task_present_triggers_task():
         recovered = start_controller_via_lifecycle(timeout_sec=1.0)
 
         assert recovered is True
-        mock_task.Run.assert_called_once_with(None)
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "/Run" in args
+        assert "/TN" in args
+        assert "desk-audio-bridge" in args
         mock_install.assert_not_called()
         mock_register.assert_not_called()
+
+
+def test_get_deployed_sha_without_git_path(tmp_path):
+    """When git CLI fails or is not in PATH, get_deployed_sha resolves SHA from repo metadata."""
+    from windows.diagnostics import get_deployed_sha
+
+    test_sha = "aabbccddeeff00112233445566778899aabbccdd"
+
+    # Create dummy detached repo directory
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    head_file = git_dir / "HEAD"
+    head_file.write_text(test_sha + "\n", encoding="utf-8")
+
+    with patch("subprocess.run", side_effect=FileNotFoundError("git.exe not found")):
+        resolved = get_deployed_sha(str(tmp_path))
+        assert resolved == test_sha
+
+
+def test_get_deployed_sha_worktree_indirection(tmp_path):
+    """When target directory is a worktree with a .git file, get_deployed_sha follows indirection."""
+    from windows.diagnostics import get_deployed_sha
+
+    test_sha = "11223344556677889900aabbccddeeff11223344"
+
+    # Create main repo git dir
+    main_git = tmp_path / "main_repo" / ".git"
+    main_git.mkdir(parents=True)
+    (main_git / "refs" / "heads").mkdir(parents=True)
+    (main_git / "refs" / "heads" / "feature-x").write_text(test_sha + "\n", encoding="utf-8")
+
+    # Create worktree gitdir
+    wt_gitdir = main_git / "worktrees" / "wt1"
+    wt_gitdir.mkdir(parents=True)
+    (wt_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    (wt_gitdir / "HEAD").write_text("ref: refs/heads/feature-x\n", encoding="utf-8")
+
+    # Create worktree directory with .git file
+    wt_dir = tmp_path / "wt1"
+    wt_dir.mkdir()
+    (wt_dir / ".git").write_text(f"gitdir: {wt_gitdir}\n", encoding="utf-8")
+
+    with patch("subprocess.run", side_effect=subprocess.SubprocessError("git error")):
+        resolved = get_deployed_sha(str(wt_dir))
+        assert resolved == test_sha
+
+
+def test_autostart_query_via_schtasks_tri_state():
+    """_query_task_via_schtasks correctly maps Installed, Not installed, and Unknown without pywin32."""
+    from windows.diagnostics import _query_task_via_schtasks
+
+    # Installed
+    ok_res = MagicMock()
+    ok_res.returncode = 0
+    with patch("subprocess.run", return_value=ok_res):
+        assert _query_task_via_schtasks() == "Installed"
+
+    # Not installed
+    not_found_res = MagicMock()
+    not_found_res.returncode = 1
+    not_found_res.stdout = ""
+    not_found_res.stderr = "ERROR: The system cannot find the file specified."
+    with patch("subprocess.run", return_value=not_found_res):
+        assert _query_task_via_schtasks() == "Not installed"
+
+    # Execution error / unexpected failure -> Unknown (not falsely Not installed)
+    err_res = MagicMock()
+    err_res.returncode = 1
+    err_res.stdout = ""
+    err_res.stderr = "ERROR: Access is denied."
+    with patch("subprocess.run", return_value=err_res):
+        assert _query_task_via_schtasks() == "Unknown"
+
+    # Exception raised -> Unknown
+    with patch("subprocess.run", side_effect=Exception("timeout")):
+        assert _query_task_via_schtasks() == "Unknown"
+
 
 
 

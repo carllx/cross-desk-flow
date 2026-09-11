@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -287,28 +288,60 @@ def classify_network_path(
     return result
 
 
-def get_autostart_status(force_probe: bool = False) -> str:
-    """Queries current-user Task Scheduler autostart status with TTL caching."""
+def _query_task_via_schtasks(task_name: str = "desk-audio-bridge") -> str:
+    """Queries task existence using built-in Windows schtasks.exe CLI.
+    
+    Returns 'Installed', 'Not installed', or 'Unknown'. Does not require pywin32.
+    """
+    kwargs = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    schtasks_exe = shutil.which("schtasks.exe") or shutil.which("schtasks") or "schtasks.exe"
+    try:
+        res = subprocess.run(
+            [schtasks_exe, "/Query", "/TN", task_name, "/FO", "LIST"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            **kwargs,
+        )
+        if res.returncode == 0:
+            return "Installed"
+        out = f"{res.stderr or ''} {res.stdout or ''}".lower()
+        if (
+            "cannot find" in out
+            or "could not find" in out
+            or "does not exist" in out
+            or "no tasks" in out
+            or "not find the file" in out
+        ):
+            return "Not installed"
+        return "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+def get_autostart_status(force_probe: bool = False, task_name: str = "desk-audio-bridge") -> str:
+    """Queries current-user Task Scheduler autostart status with TTL caching.
+    
+    Uses schtasks.exe CLI without requiring pywin32. Returns 'Installed', 'Not installed', or 'Unknown'.
+    """
     global _cached_autostart
     now = time.time()
     if not force_probe and _cached_autostart[0] and (now - _cached_autostart[1] < 30.0):
         return _cached_autostart[0]
 
-    try:
-        from windows.task_scheduler import is_scheduled_task_installed
-        installed = is_scheduled_task_installed()
-        status = "Installed" if installed else "Not installed"
-    except Exception:
-        status = "Unknown"
-
+    status = _query_task_via_schtasks(task_name)
     _cached_autostart = (status, now)
     return status
 
 
-def start_controller_via_lifecycle(timeout_sec: float = 5.0) -> bool:
+def start_controller_via_lifecycle(timeout_sec: float = 5.0, task_name: str = "desk-audio-bridge") -> bool:
     """Recovers an absent/dead controller using the existing Windows Task Scheduler lifecycle seam.
     
     Strict rules:
+    - Queries existing task via schtasks.exe CLI (no pywin32 dependency).
     - If Scheduled Task is absent, DOES NOT install or register task. Preserves Auto Start state.
     - Never directly spawns controller.py or pythonw.exe from the shell.
     - Never creates a second lifecycle or broad-kills existing processes.
@@ -316,19 +349,26 @@ def start_controller_via_lifecycle(timeout_sec: float = 5.0) -> bool:
     - Waits boundedly for the controller to become responsive on IPC.
     """
     from windows.cli import send_ipc_command
-    from windows.task_scheduler import (
-        DEFAULT_TASK_NAME,
-        _get_scheduler_folder,
-        is_scheduled_task_installed,
-    )
 
-    if not is_scheduled_task_installed():
+    task_status = _query_task_via_schtasks(task_name)
+    if task_status != "Installed":
         return False
 
+    kwargs = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    schtasks_exe = shutil.which("schtasks.exe") or shutil.which("schtasks") or "schtasks.exe"
     try:
-        folder = _get_scheduler_folder()
-        task = folder.GetTask(DEFAULT_TASK_NAME)
-        task.Run(None)
+        res = subprocess.run(
+            [schtasks_exe, "/Run", "/TN", task_name],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            **kwargs,
+        )
+        if res.returncode != 0:
+            return False
     except Exception:
         return False
 
@@ -341,8 +381,91 @@ def start_controller_via_lifecycle(timeout_sec: float = 5.0) -> bool:
     return False
 
 
+def _read_git_metadata_sha(target_dir: str) -> Optional[str]:
+    """Reads deployed commit SHA directly from Git repository metadata (.git dir or worktree).
+    
+    Does not require git executable or subprocess. Supports:
+    - Direct detached HEAD (e.g. 40 hex characters in .git/HEAD)
+    - Branch ref resolution (e.g. ref: refs/heads/... in files or packed-refs)
+    - Worktree gitdir pointer (.git file -> gitdir) and commondir
+    """
+    try:
+        git_path = os.path.join(target_dir, ".git")
+        if not os.path.exists(git_path):
+            return None
+
+        git_dir: Optional[str] = None
+        git_common_dir: Optional[str] = None
+
+        if os.path.isfile(git_path):
+            with open(git_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content.startswith("gitdir:"):
+                git_dir = content.split(":", 1)[1].strip()
+                if not os.path.isabs(git_dir):
+                    git_dir = os.path.normpath(os.path.join(target_dir, git_dir))
+                commondir_file = os.path.join(git_dir, "commondir")
+                if os.path.isfile(commondir_file):
+                    with open(commondir_file, "r", encoding="utf-8") as cf:
+                        cd_rel = cf.read().strip()
+                    git_common_dir = os.path.normpath(os.path.join(git_dir, cd_rel))
+                else:
+                    git_common_dir = git_dir
+            else:
+                return None
+        elif os.path.isdir(git_path):
+            git_dir = git_path
+            git_common_dir = git_path
+        else:
+            return None
+
+        if not git_dir:
+            return None
+
+        head_file = os.path.join(git_dir, "HEAD")
+        if not os.path.isfile(head_file):
+            return None
+
+        with open(head_file, "r", encoding="utf-8") as f:
+            head_content = f.read().strip()
+
+        hex_pattern = re.compile(r"^[0-9a-fA-F]{40}$")
+        if hex_pattern.match(head_content):
+            return head_content.lower()
+
+        if head_content.startswith("ref:"):
+            ref_part = head_content.split(":", 1)[1].strip()
+            for base_dir in (git_dir, git_common_dir):
+                if not base_dir:
+                    continue
+                ref_file = os.path.join(base_dir, ref_part.replace("/", os.sep))
+                if os.path.isfile(ref_file):
+                    with open(ref_file, "r", encoding="utf-8") as rf:
+                        ref_content = rf.read().strip()
+                    if hex_pattern.match(ref_content):
+                        return ref_content.lower()
+
+            if git_common_dir:
+                packed_refs_file = os.path.join(git_common_dir, "packed-refs")
+                if os.path.isfile(packed_refs_file):
+                    with open(packed_refs_file, "r", encoding="utf-8", errors="ignore") as pf:
+                        for line in pf:
+                            line = line.strip()
+                            if line and not line.startswith("#") and not line.startswith("^"):
+                                parts = line.split()
+                                if len(parts) >= 2 and parts[1] == ref_part and hex_pattern.match(parts[0]):
+                                    return parts[0].lower()
+    except Exception:
+        pass
+    return None
+
+
 def get_deployed_sha(repo_root: Optional[str] = None) -> str:
-    """Queries current deployed git commit SHA if repository exists."""
+    """Queries current deployed git commit SHA if repository exists.
+    
+    Attempts git CLI if available, with robust fallback to reading Git repository
+    metadata files directly if git CLI is absent from PATH or fails.
+    """
     target_dir = repo_root or REPO_ROOT
     try:
         res = subprocess.run(
@@ -355,6 +478,12 @@ def get_deployed_sha(repo_root: Optional[str] = None) -> str:
             return res.stdout.strip()
     except Exception:
         pass
+
+    # Fallback to direct Git repository metadata reading
+    meta_sha = _read_git_metadata_sha(target_dir)
+    if meta_sha:
+        return meta_sha
+
     return "unknown"
 
 
