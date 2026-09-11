@@ -309,22 +309,21 @@ def start_controller_via_lifecycle(timeout_sec: float = 5.0) -> bool:
     """Recovers an absent/dead controller using the existing Windows Task Scheduler lifecycle seam.
     
     Strict rules:
+    - If Scheduled Task is absent, DOES NOT install or register task. Preserves Auto Start state.
     - Never directly spawns controller.py or pythonw.exe from the shell.
     - Never creates a second lifecycle or broad-kills existing processes.
-    - Invokes the already-registered production Scheduled Task (or installs if missing).
+    - Only invokes the already-registered production Scheduled Task if present.
     - Waits boundedly for the controller to become responsive on IPC.
     """
     from windows.cli import send_ipc_command
     from windows.task_scheduler import (
         DEFAULT_TASK_NAME,
         _get_scheduler_folder,
-        install_scheduled_task,
         is_scheduled_task_installed,
     )
 
     if not is_scheduled_task_installed():
-        ok, _ = install_scheduled_task(start_service=True)
-        return ok
+        return False
 
     try:
         folder = _get_scheduler_folder()

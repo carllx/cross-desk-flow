@@ -367,3 +367,44 @@ def test_diagnostics_probe_caching():
     assert mock_cls.classify_interface.call_count == 1
 
 
+def test_dead_controller_recovery_task_absent_preserves_autostart():
+    """When controller is dead and Scheduled Task is absent, recovery fails safely and NEVER installs task."""
+    from windows.diagnostics import start_controller_via_lifecycle
+
+    with patch("windows.task_scheduler.is_scheduled_task_installed", return_value=False), \
+         patch("windows.task_scheduler.install_scheduled_task") as mock_install, \
+         patch("windows.task_scheduler.register_scheduled_task") as mock_register:
+
+        recovered = start_controller_via_lifecycle(timeout_sec=0.5)
+
+        # Must return False (action required / not recovered)
+        assert recovered is False
+
+        # Must NEVER install or register Scheduled Task
+        mock_install.assert_not_called()
+        mock_register.assert_not_called()
+
+
+def test_dead_controller_recovery_task_present_triggers_task():
+    """When controller is dead and Scheduled Task is present, recovery runs task and waits for IPC."""
+    from windows.diagnostics import start_controller_via_lifecycle
+
+    mock_task = MagicMock()
+    mock_folder = MagicMock()
+    mock_folder.GetTask.return_value = mock_task
+
+    with patch("windows.task_scheduler.is_scheduled_task_installed", return_value=True), \
+         patch("windows.task_scheduler._get_scheduler_folder", return_value=mock_folder), \
+         patch("windows.task_scheduler.install_scheduled_task") as mock_install, \
+         patch("windows.task_scheduler.register_scheduled_task") as mock_register, \
+         patch("windows.cli.send_ipc_command", return_value={"owner_pid": 1234}):
+
+        recovered = start_controller_via_lifecycle(timeout_sec=1.0)
+
+        assert recovered is True
+        mock_task.Run.assert_called_once_with(None)
+        mock_install.assert_not_called()
+        mock_register.assert_not_called()
+
+
+
