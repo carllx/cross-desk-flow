@@ -146,40 +146,65 @@ class SpeakerVolumeRelay:
             with self._lock:
                 v = self._volume
 
-            # Volume 1.0 -> zero-copy direct passthrough
-            if v >= 0.999:
-                try:
-                    out_sock.sendto(data, target_addr)
-                except Exception:
-                    pass
-                continue
-
-            header_len = self.parse_rtp_header_length(data)
-            if header_len is None or header_len >= len(data):
-                # Malformed or header-only packet: passthrough without touching payload
-                try:
-                    out_sock.sendto(data, target_addr)
-                except Exception:
-                    pass
-                continue
-
-            hdr, payload = data[:header_len], data[header_len:]
-
-            # Volume 0.0 -> zero-out payload, preserving RTP framing and header without dropping packet
-            if v <= 0.001:
-                zeroed_payload = b"\x00" * len(payload)
-                try:
-                    out_sock.sendto(hdr + zeroed_payload, target_addr)
-                except Exception:
-                    pass
-                continue
-
-            # Scale RTP L16 payload
-            scaled_payload = self._scale_l16_payload(payload, v)
+            out_data = self.process_packet(data, v)
             try:
-                out_sock.sendto(hdr + scaled_payload, target_addr)
+                out_sock.sendto(out_data, target_addr)
             except Exception:
                 pass
+
+    def process_packet(self, data: bytes, volume: Optional[float] = None) -> bytes:
+        """Processes a single RTP packet applying volume scaling to L16 PCM payload.
+
+        RFC 3550 Compliant:
+        - Volume 1.0 (>= 0.999): Zero-copy direct passthrough.
+        - Header length calculation includes CC (CSRC list) and X (Header Extension).
+        - If P (Padding bit) == 1:
+          - The final octet of the packet contains the padding count.
+          - Validates 0 < padding_count <= (len(data) - header_len).
+          - If malformed: fails safely by passing through original data without modifying or crashing.
+          - If valid: scales/zeroes ONLY the L16 PCM payload preceding padding.
+          - Original padding bytes (including the final count octet) and RTP header remain bit-exact.
+        - Volume 0.0 (<= 0.001): Zeroes PCM payload without dropping packets or touching header/padding.
+        """
+        if volume is None:
+            with self._lock:
+                v = self._volume
+        else:
+            v = volume
+
+        # Volume 1.0 -> zero-copy direct passthrough
+        if v >= 0.999:
+            return data
+
+        header_len = self.parse_rtp_header_length(data)
+        if header_len is None or header_len >= len(data):
+            # Malformed or header-only packet: passthrough without touching payload
+            return data
+
+        # Check RTP Padding bit (P-bit, bit 2 of octet 0, mask 0x20)
+        p_bit = (data[0] >> 5) & 0x01
+        padding_len = 0
+        if p_bit:
+            pad_count = data[-1]
+            # Validate padding count: must be > 0 and must not exceed payload section
+            if pad_count == 0 or pad_count > (len(data) - header_len):
+                # Malformed padding: fail safely by returning unmodified data
+                return data
+            padding_len = pad_count
+
+        hdr = data[:header_len]
+        pcm_end = len(data) - padding_len
+        pcm_payload = data[header_len:pcm_end]
+        padding_bytes = data[pcm_end:]
+
+        # Volume 0.0 -> zero-out PCM payload, preserving RTP header and padding bit-for-bit
+        if v <= 0.001:
+            zeroed_pcm = b"\x00" * len(pcm_payload)
+            return hdr + zeroed_pcm + padding_bytes
+
+        # Scale RTP L16 PCM payload
+        scaled_pcm = self._scale_l16_payload(pcm_payload, v)
+        return hdr + scaled_pcm + padding_bytes
 
     @staticmethod
     def parse_rtp_header_length(data: bytes) -> Optional[int]:

@@ -117,7 +117,7 @@ class FakeDeviceResolver(MacCoreAudioDeviceResolver):
 
 
 class FakeDiscoveryService:
-    def __init__(self, peer_ip: str = "192.168.1.50", local_ip: str = "192.168.1.100"):
+    def __init__(self, peer_ip: str = "127.0.0.1", local_ip: str = "127.0.0.1"):
         self.peer_available = True
         self.peer_address = peer_ip
         self.local_bind_address = local_ip

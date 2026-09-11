@@ -294,8 +294,93 @@ def test_parse_rtp_header_length_rfc3550():
 
 
 # ---------------------------------------------------------
-# 8. SpeakerVolumeRelay Real UDP Socket End-to-End Packet Path Tests
+# 7b. RFC 3550 RTP Padding (P-bit) Focused Tests
 # ---------------------------------------------------------
+
+def test_rtp_p_bit_20_percent_duck_and_preservation():
+    """Verify when RTP P-bit is 1:
+    - 20% scales ONLY L16 audio bytes
+    - RTP header remains byte-identical
+    - RTP padding remains byte-identical, including final padding-count octet
+    """
+    relay = SpeakerVolumeRelay(bind_ip="127.0.0.1", listen_port=59992, target_port=59993)
+    # Minimal RTP header (12 bytes) with P=1 (bit 2 set: 0xa0 = V=2, P=1)
+    header = bytes([0xa0, 0x60, 0x00, 0x01]) + b"\x00" * 8
+    assert len(header) == 12
+
+    # L16 PCM audio: 4 samples [1000, -2000, 10000, -10000] = 8 bytes
+    pcm_samples = [1000, -2000, 10000, -10000]
+    pcm_bytes = struct.pack(">4h", *pcm_samples)
+
+    # 4 octets of padding ending with count byte 0x04
+    padding_bytes = b"\xde\xad\xbe\x04"
+    packet = header + pcm_bytes + padding_bytes
+
+    out = relay.process_packet(packet, volume=0.2)
+
+    # 1. Header remains byte-identical
+    assert out[:12] == header
+    # 2. Audio bytes scaled to 20%
+    scaled_samples = struct.unpack(">4h", out[12:20])
+    assert scaled_samples == (200, -400, 2000, -2000)
+    # 3. Padding bytes remain completely unchanged
+    assert out[20:] == padding_bytes
+    # 4. Final padding-count octet preserved
+    assert out[-1] == 0x04
+    assert len(out) == len(packet)
+
+
+def test_rtp_p_bit_0_percent_mute_preserves_padding():
+    """Verify when RTP P-bit is 1:
+    - 0% zeroes ONLY L16 audio bytes
+    - RTP header remains byte-identical
+    - RTP padding remains byte-identical, including final padding-count octet
+    """
+    relay = SpeakerVolumeRelay(bind_ip="127.0.0.1", listen_port=59994, target_port=59995)
+    header = bytes([0xa0, 0x60, 0x00, 0x01]) + b"\x00" * 8
+    pcm_bytes = struct.pack(">4h", 1234, -5678, 9101, -1121)
+    padding_bytes = b"\x01\x02\x03\x04\x05"
+    packet = header + pcm_bytes + padding_bytes
+
+    out = relay.process_packet(packet, volume=0.0)
+
+    # Header untouched
+    assert out[:12] == header
+    # PCM zeroed
+    assert out[12:20] == b"\x00" * 8
+    # Padding bytes untouched, including count
+    assert out[20:] == padding_bytes
+    assert out[-1] == 0x05
+    assert len(out) == len(packet)
+
+
+def test_rtp_p_bit_malformed_padding_fails_safely():
+    """Verify malformed padding does not crash relay thread and fails safely via passthrough:
+    - padding count == 0
+    - padding count > remaining packet size following RTP header
+    """
+    relay = SpeakerVolumeRelay(bind_ip="127.0.0.1", listen_port=59996, target_port=59997)
+    header = bytes([0xa0, 0x60, 0x00, 0x01]) + b"\x00" * 8
+    pcm_bytes = struct.pack(">4h", 1000, -2000, 10000, -10000)
+
+    # Case A: invalid zero padding count
+    zero_pad = b"\x00\x00\x00\x00"
+    packet_zero = header + pcm_bytes + zero_pad
+    out_zero = relay.process_packet(packet_zero, volume=0.2)
+    assert out_zero == packet_zero  # Passthrough without crashing
+
+    # Case B: invalid padding count > remaining bytes following header
+    # Header is 12 bytes, payload is 8 bytes, count claims 10 bytes (which > 8)
+    invalid_pad = b"\x01\x02\x03\x04\x05\x06\x07\x0a"
+    packet_overflow = header + invalid_pad
+    out_overflow = relay.process_packet(packet_overflow, volume=0.2)
+    assert out_overflow == packet_overflow  # Passthrough without crashing
+
+    # Case C: count exceeds entire packet length
+    impossible_pad = b"\x01\x02\xff"
+    packet_impossible = header + impossible_pad
+    out_impossible = relay.process_packet(packet_impossible, volume=0.2)
+    assert out_impossible == packet_impossible  # Passthrough without crashing
 
 def test_speaker_volume_relay_real_socket_path():
     """Verifies that RTP packets sent to relay port arrive at target port:
@@ -376,6 +461,19 @@ def test_speaker_volume_relay_real_socket_path():
         sender_sock.sendto(packet, ("127.0.0.1", listen_port))
         received, _ = dest_sock.recvfrom(4096)
         assert received == packet
+
+        # Test 5: P=1 Packet over real UDP socket at 20% ducking
+        p_hdr = bytes([0xa0, 0x60, 0x00, 0x01]) + b"\x00" * 8
+        p_pcm = struct.pack(">4h", 1000, -2000, 10000, -10000)
+        p_pad = b"\x77\x88\x99\x04"
+        p_packet = p_hdr + p_pcm + p_pad
+        relay.set_volume(0.2)
+        sender_sock.sendto(p_packet, ("127.0.0.1", listen_port))
+        received_p, _ = dest_sock.recvfrom(4096)
+        assert received_p[:12] == p_hdr
+        assert struct.unpack(">4h", received_p[12:20]) == (200, -400, 2000, -2000)
+        assert received_p[20:] == p_pad
+        assert received_p[-1] == 0x04
 
     finally:
         relay.stop()

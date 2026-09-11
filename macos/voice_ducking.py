@@ -20,10 +20,10 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from bridge_core.contract import DesiredState
+from .speaker_relay import SpeakerVolumeRelay
 
 if TYPE_CHECKING:
     from .controller import MacBridgeController
-    from .speaker_relay import SpeakerVolumeRelay
 
 logger = logging.getLogger(__name__)
 
@@ -315,8 +315,6 @@ class VoiceDuckingController:
 
     def start_relay(self, bind_ip: str, listen_port: int, target_port: int) -> bool:
         """Starts or reconfigures the speaker volume relay proxy."""
-        from .speaker_relay import SpeakerVolumeRelay
-
         if self.relay:
             if (
                 self.relay.bind_ip == bind_ip

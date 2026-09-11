@@ -70,44 +70,21 @@ class FakeDeviceResolver(MacCoreAudioDeviceResolver):
         fail: bool = False,
         fail_mic: bool = False,
     ):
-        if speaker is None and not fail:
-            self._device = ResolvedAudioDevice(
-                device_id=88,
-                device_uid="BuiltInSpeakerUID_Test",
-                device_name="MacBook Air Speakers",
-                is_builtin=True,
-                output_channels=2,
-                is_default=True,
-                input_channels=0,
-            )
-        else:
-            self._device = speaker
-
-        if microphone is None and not fail and not fail_mic:
-            self._microphone = ResolvedAudioDevice(
-                device_id=89,
-                device_uid="BuiltInMicrophoneUID_Test",
-                device_name="MacBook Air Microphone",
-                is_builtin=True,
-                output_channels=0,
-                is_default=True,
-                input_channels=1,
-            )
-        else:
-            self._microphone = microphone
-
-        self.fail = fail
-        self.fail_mic = fail_mic
+        self._device = speaker if (speaker or fail) else ResolvedAudioDevice(
+            device_id=88, device_uid="BuiltInSpeakerUID_Test", device_name="MacBook Air Speakers",
+            is_builtin=True, output_channels=2, is_default=True, input_channels=0,
+        )
+        self._microphone = microphone if (microphone or fail or fail_mic) else ResolvedAudioDevice(
+            device_id=89, device_uid="BuiltInMicrophoneUID_Test", device_name="MacBook Air Microphone",
+            is_builtin=True, output_channels=0, is_default=True, input_channels=1,
+        )
+        self.fail, self.fail_mic = fail, fail_mic
 
     def resolve_builtin_speaker_device(self) -> Optional[ResolvedAudioDevice]:
-        if self.fail:
-            return None
-        return self._device
+        return None if self.fail else self._device
 
     def resolve_builtin_microphone_device(self) -> Optional[ResolvedAudioDevice]:
-        if self.fail or self.fail_mic:
-            return None
-        return self._microphone
+        return None if (self.fail or self.fail_mic) else self._microphone
 
 
 class FakeReceiverBuilder(SpeakerReceiverBuilder):
@@ -162,6 +139,29 @@ class FakeDiscoveryService:
 
     def broadcast_hello(self):
         self.broadcast_count += 1
+class FakeSpeakerVolumeRelay:
+    def __init__(self, bind_ip: str, listen_port: int = 5004, target_port: int = 5005, target_ip: str = "127.0.0.1"):
+        self.bind_ip, self.listen_port, self.target_port, self.target_ip = bind_ip, listen_port, target_port, target_ip
+        self.volume, self._running = 1.0, False
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def set_volume(self, vol: float) -> None:
+        self.volume = max(0.0, min(1.0, float(vol)))
+
+    def start(self) -> bool:
+        self._running = True
+        return True
+
+    def stop(self) -> None:
+        self._running = False
+
+
+@pytest.fixture(autouse=True)
+def isolate_speaker_relay_for_controller_tests(monkeypatch):
+    monkeypatch.setattr("macos.voice_ducking.SpeakerVolumeRelay", FakeSpeakerVolumeRelay)
 
 
 @pytest.fixture
