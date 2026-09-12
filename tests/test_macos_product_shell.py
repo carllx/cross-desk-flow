@@ -200,13 +200,13 @@ class TestProductShellAppIPC(unittest.TestCase):
 
         app = ProductShellApp(self.root, ipc_client=mock_ipc, auto_refresh_ms=0)
         self.assertEqual(app.lbl_voice_status.cget("text"), "Active")
-        self.assertEqual(app.lbl_duck_title.cget("text"), "When Mac microphone is active: 35%")
+        self.assertEqual(app.lbl_duck_title.cget("text"), "When Mac audio focus is active: 35%")
         self.assertEqual(int(round(app.duck_scale.get())), 35)
 
         # Move slider
         ipc_calls.clear()
         app.on_duck_slider_change("50")
-        self.assertEqual(app.lbl_duck_title.cget("text"), "When Mac microphone is active: 50%")
+        self.assertEqual(app.lbl_duck_title.cget("text"), "When Mac audio focus is active: 50%")
         self.assertEqual(ipc_calls, [("set-duck-level", {"level": 50})])
 
 

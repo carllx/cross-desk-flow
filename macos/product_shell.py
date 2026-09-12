@@ -302,12 +302,12 @@ class ProductShellApp:
         self.lbl_voice_status = ttk.Label(row3, text="Inactive", font=("System", 12, "bold"))
         self.lbl_voice_status.pack(side=tk.RIGHT)
 
-        # Row 4: Ducking volume control (When Mac microphone is active: 0–100%)
+        # Row 4: Ducking volume control (When Mac audio focus is active: 0–100%)
         row4 = ttk.Frame(dir_frame)
         row4.pack(fill=tk.X, pady=(6, 2))
         self.lbl_duck_title = ttk.Label(
             row4,
-            text="When Mac microphone is active: 20%",
+            text="When Mac audio focus is active: 20%",
             font=("System", 11),
         )
         self.lbl_duck_title.pack(side=tk.LEFT)
@@ -463,7 +463,7 @@ class ProductShellApp:
             self._user_adjusting_duck = True
             try:
                 self.duck_scale.set(state.duck_level)
-                self.lbl_duck_title.config(text=f"When Mac microphone is active: {int(state.duck_level)}%")
+                self.lbl_duck_title.config(text=f"When Mac audio focus is active: {int(state.duck_level)}%")
             finally:
                 self._user_adjusting_duck = False
 
@@ -479,7 +479,7 @@ class ProductShellApp:
         self._user_adjusting_duck = True
         try:
             level_int = int(round(float(val)))
-            self.lbl_duck_title.config(text=f"When Mac microphone is active: {level_int}%")
+            self.lbl_duck_title.config(text=f"When Mac audio focus is active: {level_int}%")
             if callable(self.ipc_client):
                 try:
                     self.ipc_client("set-duck-level", level=level_int)

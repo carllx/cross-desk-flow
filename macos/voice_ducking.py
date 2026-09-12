@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from bridge_core.contract import DesiredState
 from .speaker_relay import SpeakerVolumeRelay
+from .playback_detector import MacPlaybackActivityDetector
 
 if TYPE_CHECKING:
     from .controller import MacBridgeController
@@ -30,11 +31,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_SETTINGS_PATH = os.path.expanduser(
     "~/Library/Application Support/desk-audio-bridge/settings.json"
 )
-DEFAULT_DUCK_LEVEL = 20  # 20% volume when Mac mic is active (0-100)
+DEFAULT_DUCK_LEVEL = 20  # 20% volume when Local Audio Focus is active (0-100)
 
 
 class VoiceDuckingSettings:
-    """Manages persistent settings for macOS Local Voice ducking."""
+    """Manages persistent settings for macOS Local Audio Focus ducking."""
 
     def __init__(self, path: str = DEFAULT_SETTINGS_PATH):
         self.path = path
@@ -78,18 +79,22 @@ def compute_target_volume(
     is_external_mic_active: bool,
     is_dictation_active: bool,
     is_stopped: bool,
+    is_external_playback_active: bool = False,
 ) -> float:
     """Computes the target bridge volume multiplier (0.0 to 1.0).
+
+    State Composition (Local Audio Focus):
+    local_audio_focus_active = is_external_mic_active or is_external_playback_active
 
     Hierarchy:
     1. STOPPED_BY_USER -> 0.0
     2. Dictation active -> 0.0 (hard suppression for Windows dictation)
-    3. External mic active -> duck_level_percent / 100.0 (0.0 if 0%, 1.0 if 100%)
+    3. Local Audio Focus active -> duck_level_percent / 100.0 (0.0 if 0%, 1.0 if 100%)
     4. Normal playback -> 1.0
     """
     if is_stopped or is_dictation_active:
         return 0.0
-    if is_external_mic_active:
+    if is_external_mic_active or is_external_playback_active:
         clamped = max(0, min(100, duck_level_percent))
         return float(clamped) / 100.0
     return 1.0
@@ -239,7 +244,7 @@ class MacMicrophoneActivityMonitor:
 
 
 class VoiceDuckingController:
-    """Manages voice ducking settings, microphone activity monitoring, and volume relay integration."""
+    """Manages voice ducking settings, microphone activity monitoring, local playback detection, and volume relay integration."""
 
     def __init__(self, controller: Any, settings_path: Optional[str] = None):
         self.controller = controller
@@ -249,15 +254,21 @@ class VoiceDuckingController:
             on_activity_change=self._on_activity_changed,
             is_own_mic_active=self._is_own_mic_active,
         )
+        self.playback_detector = MacPlaybackActivityDetector(
+            on_activity_change=self._on_activity_changed,
+            get_current_speaker_pid=self._get_current_speaker_pid,
+        )
         self.relay: Optional[SpeakerVolumeRelay] = None
 
     def start_monitoring(self) -> None:
-        """Starts background microphone activity monitoring."""
+        """Starts background microphone activity and playback monitoring."""
         self.monitor.start()
+        self.playback_detector.start()
 
     def stop_monitoring(self) -> None:
-        """Stops background microphone activity monitoring and stops relay."""
+        """Stops background monitoring and stops relay."""
         self.monitor.stop()
+        self.playback_detector.stop()
         self.stop_relay()
 
     def set_duck_level(self, level: int) -> int:
@@ -274,8 +285,20 @@ class VoiceDuckingController:
     def is_external_mic_active(self) -> bool:
         return self.monitor.is_external_mic_active
 
+    @property
+    def is_external_playback_active(self) -> bool:
+        return self.playback_detector.is_external_playback_active
+
+    @property
+    def is_local_audio_focus_active(self) -> bool:
+        """True if either external microphone OR external local playback is active."""
+        return self.is_external_mic_active or self.is_external_playback_active
+
     def set_external_mic_active_for_test(self, active: bool) -> None:
         self.monitor.set_external_mic_active_for_test(active)
+
+    def set_external_playback_active_for_test(self, active: bool) -> None:
+        self.playback_detector.set_external_playback_active_for_test(active)
 
     def _is_own_mic_active(self) -> bool:
         c = self.controller
@@ -287,6 +310,14 @@ class VoiceDuckingController:
         except Exception:
             return False
 
+    def _get_current_speaker_pid(self) -> Optional[int]:
+        """Returns the controller's CURRENT authoritative owned speaker child PID."""
+        c = self.controller
+        try:
+            return c._speaker_child_pid
+        except Exception:
+            return None
+
     def _on_activity_changed(self, active: bool) -> None:
         self.recalculate_and_apply_volume()
 
@@ -296,12 +327,14 @@ class VoiceDuckingController:
         is_stopped = bool(c._desired_state == DesiredState.STOPPED_BY_USER)
         is_dictation = bool(c._current_dictation_session is not None)
         is_ext_mic = self.is_external_mic_active
+        is_ext_playback = self.is_external_playback_active
 
         target_vol = compute_target_volume(
             duck_level_percent=self.duck_level,
             is_external_mic_active=is_ext_mic,
             is_dictation_active=is_dictation,
             is_stopped=is_stopped,
+            is_external_playback_active=is_ext_playback,
         )
 
         if self.relay:

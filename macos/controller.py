@@ -450,7 +450,7 @@ class MacBridgeController:
                 pack43_available=None,
                 last_actionable_microphone_error=self._last_actionable_microphone_error,
                 duck_level=self.voice_ducking.get_duck_level(),
-                local_voice_active=self.voice_ducking.is_external_mic_active,
+                local_voice_active=self.voice_ducking.is_local_audio_focus_active,
             )
 
     def reconcile(self) -> None:
